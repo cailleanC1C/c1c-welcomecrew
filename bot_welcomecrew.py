@@ -557,6 +557,45 @@ def _parse_closed_name(name: str):
         return None, None
     return m.group(1), m.group(2).strip()
 
+def _service_account_email() -> str:
+    raw = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
+    if not raw:
+        return "(GOOGLE_SERVICE_ACCOUNT_JSON not set)"
+    try:
+        return json.loads(raw).get("client_email", "(no client_email in JSON)")
+    except Exception:
+        return "(malformed JSON)"
+
+@bot.tree.command(name="sheet_status", description="Check Google Sheets connectivity")
+async def sheet_status(itx: discord.Interaction):
+    await itx.response.defer(ephemeral=True, thinking=True)
+    email = _service_account_email()
+    try:
+        ws = _get_ws()
+    except Exception as e:
+        return await itx.followup.send(f"Could not open sheet: `{e}`\nService account: `{email}`", ephemeral=True)
+
+    if not ws:
+        return await itx.followup.send(
+            "Sheet not configured or not accessible.\n"
+            "• Check `GSHEET_ID`\n"
+            "• Share the sheet with the service account as **Editor**\n"
+            f"Service account: `{email}`",
+            ephemeral=True
+        )
+    try:
+        title = ws.spreadsheet.title
+        tab = ws.title
+        rows = len(ws.col_values(1))  # tickets in column A (incl. header)
+        await itx.followup.send(
+            f"Connected to **{title} / {tab}**. Rows in column A: **{rows}**.\n"
+            f"Service account: `{email}`",
+            ephemeral=True
+        )
+    except Exception as e:
+        await itx.followup.send(f"Opened worksheet but failed to read values: `{e}`\nService account: `{email}`", ephemeral=True)
+
+
 # ---------- Placement prompt on Ticket Close ----------
 _pending_close: dict[int, int] = {}      # thread_id -> closer_user_id
 _close_prompt_msg: dict[int, int] = {}   # thread_id -> message id
@@ -822,3 +861,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
