@@ -1,2 +1,4 @@
-discord.py
-flask
+discord.py>=2.4
+gspread>=6.0
+tzdata>=2024.1
+aiohttp>=3.9
