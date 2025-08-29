@@ -14,6 +14,7 @@
 #   GSHEET_WORKSHEET (optional)
 #   TIMEZONE (e.g., Europe/Vienna)
 #   CLAN_TAGS (e.g., C1CM,C1CE,C1CB,VGR,MRTRS)
+#   PYTHONUNBUFFERED=1   <-- recommended
 # ------------------------------------------------------------
 
 import os
@@ -22,6 +23,8 @@ import asyncio
 import json
 from datetime import datetime
 from typing import Optional
+
+print("[boot] starting bot_welcomecrew.py", flush=True)
 
 import discord
 from discord.ext import commands
@@ -54,6 +57,9 @@ COLOR_WARN = 0xF1C40F
 intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
+
+# Backfill live status
+_backfill_state = {"running": False, "phase": "", "scanned": 0, "added": 0, "skipped": 0}
 
 # ---------- Session store ----------
 class Session:
@@ -442,6 +448,7 @@ async def on_thread_create(thread: discord.Thread):
     try:
         m = await thread.send(embed=start_embed(mention), view=view)
         _thread_prompt_msg_id[thread.id] = m.id
+        print(f"[on_thread_create] posted start panel in {thread.name}", flush=True)
     except discord.Forbidden:
         await thread.parent.send(f"Could not post in {thread.name}. Check bot thread permissions.")
 
@@ -495,7 +502,7 @@ def _find_ticket_row(ws, ticket: str) -> Optional[int]:
     try:
         colA = ws.col_values(1)
     except Exception as e:
-        print("Sheets read col A failed:", e)
+        print("Sheets read col A failed:", e, flush=True)
         return None
     wanted = _norm_ticket(ticket)
     for i, v in enumerate(colA[1:], start=2):  # row 1 header
@@ -506,20 +513,20 @@ def _find_ticket_row(ws, ticket: str) -> Optional[int]:
 def _upsert_ticket_row(ticket: str, username: str, tag: str, date_closed: str) -> str:
     ws = _get_ws()
     if not ws:
-        print("Upsert: no worksheet (check GSHEET env/share).")
+        print("Upsert: no worksheet (check GSHEET env/share).", flush=True)
         return "no_ws"
     try:
         row = _find_ticket_row(ws, ticket)
         if row:
             ws.batch_update([{"range": f"A{row}:D{row}", "values": [[ticket, username, tag, date_closed]]}])
-            print(f"Upsert: updated ticket {ticket} at row {row}")
+            print(f"Upsert: updated ticket {ticket} at row {row}", flush=True)
             return "updated"
         else:
             ws.append_row([ticket, username, tag, date_closed], value_input_option="USER_ENTERED")
-            print(f"Upsert: inserted ticket {ticket}")
+            print(f"Upsert: inserted ticket {ticket}", flush=True)
             return "inserted"
     except Exception as e:
-        print("Upsert error:", e)
+        print("Upsert error:", e, flush=True)
         return "error"
 
 def _parse_date_str(s: str) -> Optional[datetime]:
@@ -551,6 +558,16 @@ async def sheet_status(itx: discord.Interaction):
     except Exception as e:
         await itx.followup.send(f"Opened worksheet but failed to read values: `{e}`\nService account: `{email}`", ephemeral=True)
 
+@bot.tree.command(name="backfill_status", description="Show current backfill progress")
+async def backfill_status(itx: discord.Interaction):
+    st = _backfill_state
+    await itx.response.send_message(
+        f"Running: **{st['running']}**\n"
+        f"Phase: **{st.get('phase','')}**\n"
+        f"Scanned: **{st['scanned']}** | Added: **{st['added']}** | Skipped: **{st['skipped']}**",
+        ephemeral=True
+    )
+
 @bot.tree.command(name="dedupe_sheet", description="Remove duplicate tickets (keeps newest by 'date closed')")
 async def dedupe_sheet(itx: discord.Interaction):
     await itx.response.defer(ephemeral=True, thinking=True)
@@ -579,7 +596,7 @@ async def dedupe_sheet(itx: discord.Interaction):
                     if cur_dt and old_dt: return cur_dt > old_dt
                     if cur_dt and not old_dt: return True
                     if not cur_dt and old_dt: return False
-                    return cur_idx > old_idx  # neither parseable, keep bottom-most
+                    return cur_idx > old_idx  # neither parseable, keep bottom-most (newest append)
                 if is_newer(idx, dt, best_idx, best_dt):
                     winners[ticket] = (idx, dt)
 
@@ -688,7 +705,7 @@ async def on_message(message: discord.Message):
         except Exception:
             pass
 
-# ---------- Backfill ----------
+# ---------- Backfill (with live progress) ----------
 async def _find_closed_timestamp(thread: discord.Thread) -> str:
     try:
         async for msg in thread.history(limit=50, oldest_first=False):
@@ -718,42 +735,82 @@ async def _append_if_new(ticket: str, username: str, tag: str, date_closed: str)
     status = _upsert_ticket_row(ticket, username, tag, date_closed)
     if status == "inserted": return True
     if status == "updated":
-        print(f"Backfill: updated existing ticket {ticket}")
+        print(f"Backfill: updated existing ticket {ticket}", flush=True)
         return False
     if status == "no_ws":
-        print("Backfill: skip – worksheet is None (check GSHEET_ID / share).")
+        print("Backfill: skip – worksheet is None (check GSHEET_ID / share).", flush=True)
     return False
 
-async def _scan_threads_in_channel(channel: discord.TextChannel, max_threads: int = 0) -> tuple[int, int, int]:
+async def _scan_threads_in_channel(channel: discord.TextChannel, max_threads: int = 0, progress_cb=None) -> tuple[int, int, int]:
     added = skipped = scanned = 0
+
+    async def report(phase_local: str):
+        _backfill_state.update(running=True, phase=phase_local, scanned=scanned, added=added, skipped=skipped)
+        if progress_cb:
+            try:
+                await progress_cb(scanned, added, skipped, phase_local)
+            except Exception:
+                pass
 
     async def handle_thread(t: discord.Thread):
         nonlocal added, skipped, scanned
-        if not re.match(r"(?i)closed-", t.name or ""): return
+        if not re.match(r"(?i)closed-", t.name or ""):
+            return
         scanned += 1
-        try: await t.join()
-        except: pass
+        try:
+            await t.join()
+        except Exception:
+            pass
         ticket, username = _parse_closed_name(t.name)
-        if not ticket: return
+        if not ticket:
+            return
         tag = _extract_tag_from_thread_name(t.name)
         date_closed = await _find_closed_timestamp(t)
         ok = await _append_if_new(ticket, username or "", tag, date_closed)
         if ok: added += 1
         else: skipped += 1
+
+        if scanned % 20 == 0:
+            await report(_backfill_state.get("phase", ""))
+
         await asyncio.sleep(0.2)
 
+    # Active
+    await report("active")
     for t in channel.threads:
         await handle_thread(t)
-        if max_threads and scanned >= max_threads: return (added, skipped, scanned)
+        if max_threads and scanned >= max_threads:
+            await report("active"); _backfill_state["running"] = False
+            return (added, skipped, scanned)
 
-    async for t in channel.archived_threads(limit=None, private=False):
-        await handle_thread(t)
-        if max_threads and scanned >= max_threads: return (added, skipped, scanned)
+    # Archived public
+    await report("archived public")
+    try:
+        async for t in channel.archived_threads(limit=None, private=False):
+            await handle_thread(t)
+            if max_threads and scanned >= max_threads:
+                await report("archived public"); _backfill_state["running"] = False
+                return (added, skipped, scanned)
+    except discord.Forbidden:
+        print("Backfill: forbidden reading archived public threads. Check permissions.", flush=True)
+    except Exception as e:
+        print("Backfill: error reading archived public threads:", e, flush=True)
 
-    async for t in channel.archived_threads(limit=None, private=True):
-        await handle_thread(t)
-        if max_threads and scanned >= max_threads: return (added, skipped, scanned)
+    # Archived private (needs Manage Threads)
+    await report("archived private")
+    try:
+        async for t in channel.archived_threads(limit=None, private=True):
+            await handle_thread(t)
+            if max_threads and scanned >= max_threads:
+                await report("archived private"); _backfill_state["running"] = False
+                return (added, skipped, scanned)
+    except discord.Forbidden:
+        print("Backfill: forbidden reading archived private threads. Grant Manage Threads.", flush=True)
+    except Exception as e:
+        print("Backfill: error reading archived private threads:", e, flush=True)
 
+    _backfill_state["running"] = False
+    await report("done")
     return (added, skipped, scanned)
 
 @bot.tree.command(name="backfill_tickets", description="Scan closed ticket threads and log them to the Google Sheet")
@@ -763,8 +820,27 @@ async def backfill_tickets(itx: discord.Interaction, max_threads: int = 0):
     channel = bot.get_channel(WELCOME_CHANNEL_ID)
     if channel is None or not isinstance(channel, discord.TextChannel):
         return await itx.followup.send("WELCOME_CHANNEL_ID is not a text channel I can see.", ephemeral=True)
-    added, skipped, scanned = await _scan_threads_in_channel(channel, max_threads=max_threads)
-    await itx.followup.send(f"Backfill complete. Scanned {scanned}, added {added}, skipped {skipped}.", ephemeral=True)
+
+    _backfill_state.update(running=True, phase="starting", scanned=0, added=0, skipped=0)
+    status = await itx.followup.send("Starting backfill…", ephemeral=True)
+
+    async def progress_cb(scanned, added, skipped, phase):
+        _backfill_state.update(running=True, phase=phase, scanned=scanned, added=added, skipped=skipped)
+        try:
+            await itx.followup.edit_message(
+                status.id,
+                content=f"Backfill running…\nPhase: **{phase}**\nScanned: **{scanned}** | Added: **{added}** | Skipped: **{skipped}**"
+            )
+        except Exception:
+            pass
+
+    added, skipped, scanned = await _scan_threads_in_channel(channel, max_threads=max_threads, progress_cb=progress_cb)
+    _backfill_state.update(running=False, phase="done", scanned=scanned, added=added, skipped=skipped)
+
+    await itx.followup.edit_message(
+        status.id,
+        content=f"Backfill complete. Scanned **{scanned}**, added **{added}**, skipped **{skipped}**."
+    )
 
 # ---------- Optional manual command ----------
 @bot.tree.command(name="apply", description="Start the C1C application wizard here")
@@ -782,8 +858,8 @@ async def on_ready():
         if GUILD_ID: await bot.tree.sync(guild=discord.Object(id=GUILD_ID))
         else:        await bot.tree.sync()
     except Exception as e:
-        print("Slash sync error:", e)
-    print(f"Logged in as {bot.user}.")
+        print("Slash sync error:", e, flush=True)
+    print(f"Logged in as {bot.user}.", flush=True)
 
 # ---------- Render web service runner ----------
 from aiohttp import web
@@ -800,7 +876,7 @@ async def run_web():
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
-    print(f"Health server up on :{port}")
+    print(f"Health server up on :{port}", flush=True)
 
 async def run_bot():
     await bot.start(TOKEN)
@@ -810,4 +886,3 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-
