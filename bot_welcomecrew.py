@@ -566,6 +566,7 @@ def _service_account_email() -> str:
     except Exception:
         return "(malformed JSON)"
 
+# ---------- Diagnostics ----------
 @bot.tree.command(name="sheet_status", description="Check Google Sheets connectivity")
 async def sheet_status(itx: discord.Interaction):
     await itx.response.defer(ephemeral=True, thinking=True)
@@ -578,15 +579,15 @@ async def sheet_status(itx: discord.Interaction):
     if not ws:
         return await itx.followup.send(
             "Sheet not configured or not accessible.\n"
-            "• Check `GSHEET_ID`\n"
-            "• Share the sheet with the service account as **Editor**\n"
+            "• Check GSHEET_ID\n"
+            "• Share the sheet with the service account as Editor\n"
             f"Service account: `{email}`",
             ephemeral=True
         )
     try:
         title = ws.spreadsheet.title
         tab = ws.title
-        rows = len(ws.col_values(1))  # tickets in column A (incl. header)
+        rows = len(ws.col_values(1))  # tickets in column A (includes header)
         await itx.followup.send(
             f"Connected to **{title} / {tab}**. Rows in column A: **{rows}**.\n"
             f"Service account: `{email}`",
@@ -594,7 +595,6 @@ async def sheet_status(itx: discord.Interaction):
         )
     except Exception as e:
         await itx.followup.send(f"Opened worksheet but failed to read values: `{e}`\nService account: `{email}`", ephemeral=True)
-
 
 # ---------- Placement prompt on Ticket Close ----------
 _pending_close: dict[int, int] = {}      # thread_id -> closer_user_id
@@ -768,7 +768,6 @@ async def _append_if_new(ticket: str, username: str, tag: str, date_closed: str)
         print("Backfill: append failed:", e)
         return False
 
-
 async def _scan_threads_in_channel(channel: discord.TextChannel, max_threads: int = 0) -> tuple[int, int, int]:
     added = skipped = scanned = 0
 
@@ -866,5 +865,3 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-
-
