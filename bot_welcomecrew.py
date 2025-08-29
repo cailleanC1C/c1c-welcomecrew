@@ -1,4 +1,4 @@
-# bot.py
+# bot_welcomecrew.py
 # ------------------------------------------------------------
 # Requires Python 3.10+ and:
 #   pip install -U discord.py gspread tzdata aiohttp
