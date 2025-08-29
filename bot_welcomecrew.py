@@ -1,4 +1,4 @@
-# bot.py
+# bot_welcomecrew.py
 # ------------------------------------------------------------
 # Requires Python 3.10+ and:
 #   pip install -U discord.py gspread tzdata aiohttp
@@ -810,3 +810,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
