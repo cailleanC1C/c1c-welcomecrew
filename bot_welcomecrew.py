@@ -14,7 +14,7 @@
 #   GSHEET_WORKSHEET (optional)
 #   TIMEZONE (e.g., Europe/Vienna)
 #   CLAN_TAGS (e.g., C1CM,C1CE,C1CB,VGR,MRTRS)
-#   PYTHONUNBUFFERED=1   <-- recommended
+#   PYTHONUNBUFFERED=1   <-- recommended for real-time logs
 # ------------------------------------------------------------
 
 import os
@@ -705,7 +705,7 @@ async def on_message(message: discord.Message):
         except Exception:
             pass
 
-# ---------- Backfill (with live progress) ----------
+# ---------- Backfill (with cached sheet index + live progress) ----------
 async def _find_closed_timestamp(thread: discord.Thread) -> str:
     try:
         async for msg in thread.history(limit=50, oldest_first=False):
@@ -731,9 +731,56 @@ def _extract_tag_from_thread_name(name: str) -> str:
     if m and m.group(2): return m.group(2).upper()
     return ""
 
-async def _append_if_new(ticket: str, username: str, tag: str, date_closed: str) -> bool:
-    status = _upsert_ticket_row(ticket, username, tag, date_closed)
-    if status == "inserted": return True
+# ------ Cached sheet index to avoid read-rate limits ------
+class SheetIndex:
+    """Cache column A once, then upsert without further reads during backfill."""
+    def __init__(self, ws):
+        self.ws = ws
+        self.map: dict[str, int] = {}   # ticket(norm) -> row (1-based)
+        self.next_row = 2               # first free row index
+
+    @classmethod
+    def from_sheet(cls, ws: gspread.Worksheet) -> "SheetIndex":
+        idx = cls(ws)
+        values = ws.get_all_values()  # ONE read for the whole sheet
+        idx.next_row = len(values) + 1 if values else 2
+        for row_idx, row in enumerate(values[1:], start=2):  # skip header
+            if not row:
+                continue
+            t = _norm_ticket(row[0] if len(row) > 0 else "")
+            if t:
+                idx.map[t] = row_idx
+        print(f"[sheet-index] cached {len(idx.map)} tickets, next_row={idx.next_row}", flush=True)
+        return idx
+
+    def upsert(self, ticket: str, username: str, tag: str, date_closed: str) -> str:
+        key = _norm_ticket(ticket)
+        if not key:
+            return "error"
+        if key in self.map:
+            row = self.map[key]
+            self.ws.batch_update([{
+                "range": f"A{row}:D{row}",
+                "values": [[ticket, username, tag, date_closed]],
+            }])
+            print(f"Upsert(indexed): updated ticket {ticket} at row {row}", flush=True)
+            return "updated"
+        else:
+            self.ws.append_row([ticket, username, tag, date_closed], value_input_option="USER_ENTERED")
+            self.map[key] = self.next_row
+            print(f"Upsert(indexed): inserted ticket {ticket} at row {self.next_row}", flush=True)
+            self.next_row += 1
+            return "inserted"
+
+async def _append_if_new(ticket: str, username: str, tag: str, date_closed: str, idx: SheetIndex | None) -> bool:
+    """Backfill path: use the cached SheetIndex to avoid read-rate limits."""
+    if not idx:
+        status = _upsert_ticket_row(ticket, username, tag, date_closed)
+    else:
+        status = idx.upsert(ticket, username, tag, date_closed)
+
+    if status == "inserted":
+        return True
     if status == "updated":
         print(f"Backfill: updated existing ticket {ticket}", flush=True)
         return False
@@ -741,8 +788,16 @@ async def _append_if_new(ticket: str, username: str, tag: str, date_closed: str)
         print("Backfill: skip – worksheet is None (check GSHEET_ID / share).", flush=True)
     return False
 
-async def _scan_threads_in_channel(channel: discord.TextChannel, max_threads: int = 0, progress_cb=None) -> tuple[int, int, int]:
+async def _scan_threads_in_channel(
+    channel: discord.TextChannel,
+    max_threads: int = 0,
+    progress_cb=None
+) -> tuple[int, int, int]:
     added = skipped = scanned = 0
+
+    # build ONE sheet index for the whole backfill
+    ws = _get_ws()
+    idx = SheetIndex.from_sheet(ws) if ws else None
 
     async def report(phase_local: str):
         _backfill_state.update(running=True, phase=phase_local, scanned=scanned, added=added, skipped=skipped)
@@ -766,14 +821,16 @@ async def _scan_threads_in_channel(channel: discord.TextChannel, max_threads: in
             return
         tag = _extract_tag_from_thread_name(t.name)
         date_closed = await _find_closed_timestamp(t)
-        ok = await _append_if_new(ticket, username or "", tag, date_closed)
+
+        ok = await _append_if_new(ticket, username or "", tag, date_closed, idx)
         if ok: added += 1
         else: skipped += 1
 
         if scanned % 20 == 0:
             await report(_backfill_state.get("phase", ""))
 
-        await asyncio.sleep(0.2)
+        # gentle on write quota
+        await asyncio.sleep(0.15)
 
     # Active
     await report("active")
