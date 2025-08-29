@@ -750,19 +750,24 @@ async def _find_closed_timestamp(thread: discord.Thread) -> str:
 async def _append_if_new(ticket: str, username: str, tag: str, date_closed: str) -> bool:
     ws = _get_ws()
     if not ws:
+        print("Backfill: skip – worksheet is None (check GSHEET_ID / service account share).")
         return False
     try:
-        colA = ws.col_values(1)  # ticket number
-        if any(c.strip() == ticket for c in colA[1:]):
+        colA = ws.col_values(1)  # 'ticket number'
+        if any(c.strip() == ticket for c in colA[1:]):  # skip header
+            print(f"Backfill: skip duplicate ticket {ticket}")
             return False
-    except Exception:
-        pass
+    except Exception as e:
+        print("Backfill: could not read column A:", e)
+
     try:
         ws.append_row([ticket, username, tag, date_closed], value_input_option="USER_ENTERED")
+        print(f"Backfill: added ticket {ticket}")
         return True
     except Exception as e:
-        print("Sheets append failed:", e)
+        print("Backfill: append failed:", e)
         return False
+
 
 async def _scan_threads_in_channel(channel: discord.TextChannel, max_threads: int = 0) -> tuple[int, int, int]:
     added = skipped = scanned = 0
@@ -861,4 +866,5 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
 
