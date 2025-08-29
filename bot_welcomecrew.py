@@ -1,510 +1,736 @@
-# bot_clanmatch_prefix.py
+# bot_welcomecrew.py
+# ------------------------------------------------------------
+# Requires Python 3.10+ and:
+#   pip install -U discord.py gspread
+#
+# ENV VARS you must set:
+#   DISCORD_TOKEN
+#   WELCOME_CHANNEL_ID        (channel where Ticket Tool opens threads)
+#   TICKET_TOOL_BOT_ID        (public Ticket Tool: 557628352828014614)
+#   RECRUITER_ROLE_ID         (optional; ping on summary)
+#   GUILD_ID                  (optional; speeds slash sync)
+#
+# For Google Sheets logging (placement + backfill):
+#   GSHEET_ID
+#   GOOGLE_SERVICE_ACCOUNT_JSON   (full JSON; paste as env var)
+#   GSHEET_WORKSHEET              (optional tab name)
+#   TIMEZONE                      (e.g., Europe/Vienna)
+#   CLAN_TAGS                     (comma list, e.g. "C1CM,C1CE,C1CB,VGR,MRTRS")
+# ------------------------------------------------------------
 
-import os, json, time, asyncio, re, traceback
+import os, re, asyncio, textwrap, json
+from datetime import datetime
+from typing import Optional
+
 import discord
 from discord.ext import commands
-from discord import InteractionResponded
-from collections import defaultdict
+from discord import app_commands
+
 import gspread
-from google.oauth2.service_account import Credentials
-from aiohttp import web
+try:
+    from zoneinfo import ZoneInfo
+except Exception:
+    ZoneInfo = None  # older Pythons: will fall back to UTC
 
-# ------------------- boot/uptime -------------------
-START_TS = time.time()
+# ---------- Config ----------
+TOKEN = os.getenv("DISCORD_TOKEN")
+GUILD_ID = int(os.getenv("GUILD_ID", "0"))
+WELCOME_CHANNEL_ID = int(os.getenv("WELCOME_CHANNEL_ID", "0"))
+TICKET_TOOL_BOT_ID = int(os.getenv("TICKET_TOOL_BOT_ID", "0"))
+RECRUITER_ROLE_ID = int(os.getenv("RECRUITER_ROLE_ID", "0"))
 
-# ------------------- ENV -------------------
-CREDS_JSON = os.environ.get("GSPREAD_CREDENTIALS")
-SHEET_ID = os.environ.get("GOOGLE_SHEET_ID")
-WORKSHEET_NAME = os.environ.get("WORKSHEET_NAME", "bot_info")
-SCOPES = ["https://www.googleapis.com/auth/spreadsheets.readonly"]
+GSHEET_ID = os.getenv("GSHEET_ID", "")
+GSHEET_WORKSHEET = os.getenv("GSHEET_WORKSHEET", "")
+TIMEZONE = os.getenv("TIMEZONE", "UTC")
+CLAN_TAGS = [t.strip() for t in os.getenv("CLAN_TAGS", "C1CM,C1CE,C1CB").split(",") if t.strip()]
 
-if not CREDS_JSON:
-    print("[boot] GSPREAD_CREDENTIALS missing", flush=True)
-if not SHEET_ID:
-    print("[boot] GOOGLE_SHEET_ID missing", flush=True)
-print(f"[boot] WORKSHEET_NAME={WORKSHEET_NAME}", flush=True)
+THREAD_NAME_REGEX = r"^\d{3,6}-"   # e.g., 0297-swerve13
+COLOR_PRIMARY = 0x5865F2
+COLOR_SUCCESS = 0x2ECC71
+COLOR_WARN    = 0xF1C40F
 
-# ------------------- Sheets (lazy + cache) -------------------
-_gc = None
-_ws = None
-_cache_rows = None
-_cache_time = 0.0
-CACHE_TTL = 60  # seconds
-
-def _fmt_uptime():
-    secs = int(time.time() - START_TS)
-    h, r = divmod(secs, 3600)
-    m, s = divmod(r, 60)
-    return f"{h:02d}:{m:02d}:{s:02d}"
-
-def get_ws(force=False):
-    """Connect to Google Sheets only when needed."""
-    global _gc, _ws
-    if force:
-        _ws = None
-    if _ws is not None:
-        return _ws
-    creds = Credentials.from_service_account_info(json.loads(CREDS_JSON), scopes=SCOPES)
-    _gc = gspread.authorize(creds)
-    _ws = _gc.open_by_key(SHEET_ID).worksheet(WORKSHEET_NAME)
-    print("[sheets] Connected to worksheet OK", flush=True)
-    return _ws
-
-def get_rows(force=False):
-    """Return all rows with simple 60s cache."""
-    global _cache_rows, _cache_time
-    if force or _cache_rows is None or (time.time() - _cache_time) > CACHE_TTL:
-        ws = get_ws(force=False)
-        _cache_rows = ws.get_all_values()
-        _cache_time = time.time()
-    return _cache_rows
-
-def clear_cache():
-    global _cache_rows, _cache_time, _ws
-    _cache_rows = None
-    _cache_time = 0.0
-    _ws = None  # reconnect next time
-
-# ------------------- Column map (0-based) -------------------
-COL_B_CLAN, COL_C_TAG, COL_E_SPOTS = 1, 2, 4
-# Filters P–U
-COL_P_CB, COL_Q_HYDRA, COL_R_CHIM, COL_S_CVC, COL_T_SIEGE, COL_U_STYLE = 15, 16, 17, 18, 19, 20
-# Entry Criteria V–AB
-IDX_V, IDX_W, IDX_X, IDX_Y, IDX_Z, IDX_AA, IDX_AB = 21, 22, 23, 24, 25, 26, 27
-# AC / AD / AE add-ons
-IDX_AC_RESERVED, IDX_AD_COMMENTS, IDX_AE_REQUIREMENTS = 28, 29, 30
-
-# ------------------- Helpers -------------------
-def norm(s: str) -> str:
-    return (s or "").strip().upper()
-
-def is_header_row(row) -> bool:
-    """Detect and ignore header/label rows that look like CLAN/TAG/Spots."""
-    b = norm(row[COL_B_CLAN]) if len(row) > COL_B_CLAN else ""
-    c = norm(row[COL_C_TAG])  if len(row) > COL_C_TAG  else ""
-    e = norm(row[COL_E_SPOTS]) if len(row) > COL_E_SPOTS else ""
-    return b in {"CLAN", "CLAN NAME"} or c == "TAG" or e == "SPOTS"
-
-TOKEN_MAP = {
-    "EASY":"ESY","NORMAL":"NML","HARD":"HRD","BRUTAL":"BTL","NM":"NM","UNM":"UNM","ULTRA-NIGHTMARE":"UNM"
-}
-def map_token(choice: str) -> str:
-    c = norm(choice)
-    return TOKEN_MAP.get(c, c)
-
-def cell_has_diff(cell_text: str, token: str | None) -> bool:
-    if not token:
-        return True
-    t = map_token(token)
-    c = norm(cell_text)
-    return (t in c or (t=="HRD" and "HARD" in c) or (t=="NML" and "NORMAL" in c) or (t=="BTL" and "BRUTAL" in c))
-
-def cell_equals_10(cell_text: str, expected: str | None) -> bool:
-    if expected is None:
-        return True
-    return (cell_text or "").strip() == expected  # exact 1/0
-
-def playstyle_ok(cell_text: str, value: str | None) -> bool:
-    if not value:
-        return True
-    return norm(value) in norm(cell_text)
-
-def parse_spots_num(cell_text: str) -> int:
-    m = re.search(r"\d+", cell_text or "")
-    return int(m.group()) if m else 0
-
-def row_matches(row, cb, hydra, chimera, cvc, siege, playstyle) -> bool:
-    if len(row) <= IDX_AB:
-        return False
-    if is_header_row(row):
-        return False
-    if not (row[COL_B_CLAN] or "").strip():
-        return False
-    return (
-        cell_has_diff(row[COL_P_CB], cb) and
-        cell_has_diff(row[COL_Q_HYDRA], hydra) and
-        cell_has_diff(row[COL_R_CHIM], chimera) and
-        cell_equals_10(row[COL_S_CVC], cvc) and
-        cell_equals_10(row[COL_T_SIEGE], siege) and
-        playstyle_ok(row[COL_U_STYLE], playstyle)
-    )
-
-# ------------------- Formatting -------------------
-def build_entry_criteria(row) -> str:
-    """
-    V/W labeled (not bold); X/Y/Z verbatim; AA/AB labeled (not bold).
-    Wider spacing between items via NBSP around the pipe.
-    """
-    NBSP_PIPE = "\u00A0|\u00A0"  # non-breaking spaces around the pipe
-    parts = []
-
-    v  = (row[IDX_V]  or "").strip()   # Hydra keys
-    w  = (row[IDX_W]  or "").strip()   # Chimera keys
-    x  = (row[IDX_X]  or "").strip()   # Hydra Clash (verbatim)
-    y  = (row[IDX_Y]  or "").strip()   # Chimera Clash (verbatim)
-    z  = (row[IDX_Z]  or "").strip()   # CB Damage (verbatim)
-    aa = (row[IDX_AA] or "").strip()   # non PR CvC
-    ab = (row[IDX_AB] or "").strip()   # PR CvC
-
-    if v:  parts.append(f"Hydra keys: {v}")
-    if w:  parts.append(f"Chimera keys: {w}")
-    if x:  parts.append(x)
-    if y:  parts.append(y)
-    if z:  parts.append(z)
-    if aa: parts.append(f"non PR CvC: {aa}")
-    if ab: parts.append(f"PR CvC: {ab}")
-
-    return "**Entry Criteria:** " + (NBSP_PIPE.join(parts) if parts else "—")
-
-def format_filters_footer(cb, hydra, chimera, cvc, siege, playstyle, roster_mode) -> str:
-    parts = []
-    if cb: parts.append(f"CB: {cb}")
-    if hydra: parts.append(f"Hydra: {hydra}")
-    if chimera: parts.append(f"Chimera: {chimera}")
-    if cvc is not None:   parts.append(f"CvC: {'Yes' if cvc == '1' else 'No'}")
-    if siege is not None: parts.append(f"Siege: {'Yes' if siege == '1' else 'No'}")
-    if playstyle: parts.append(f"Playstyle: {playstyle}")
-
-    roster_text = "All" if roster_mode is None else ("Open only" if roster_mode == "open" else "Full only")
-    parts.append(f"Roster: {roster_text}")
-    return " • ".join(parts)
-
-def make_embed_for_row(row, filters_text: str) -> discord.Embed:
-    """Header shows Reserved (AC) when present; body adds AE and AD lines with blank-line spacing."""
-    clan     = (row[COL_B_CLAN] or "").strip()
-    tag      = (row[COL_C_TAG]  or "").strip()
-    spots    = (row[COL_E_SPOTS] or "").strip()
-    reserved = (row[IDX_AC_RESERVED] or "").strip()        # AC
-    comments = (row[IDX_AD_COMMENTS] or "").strip()        # AD
-    addl_req = (row[IDX_AE_REQUIREMENTS] or "").strip()    # AE
-
-    title = f"{clan}  `{tag}`  — Spots: {spots}"
-    if reserved:
-        title += f" | Reserved: {reserved}"
-
-    # Blank line between sections
-    sections = [build_entry_criteria(row)]
-    if addl_req:
-        sections.append(f"**Additional Requirements:** {addl_req}")
-    if comments:
-        sections.append(f"**Clan Needs/Comments:** {comments}")
-
-    e = discord.Embed(title=title, description="\n\n".join(sections))
-    e.set_footer(text=f"Filters used: {filters_text}")
-    return e
-
-# ------------------- Discord bot -------------------
+# ---------- Bot ----------
 intents = discord.Intents.default()
+# We don't read user messages; but keep True for widest compat with bot messages.
 intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-LAST_CALL = defaultdict(float)
-ACTIVE_PANELS = {}
-COOLDOWN_SEC = 2.0
+# ---------- Session store ----------
+class Session:
+    def __init__(self, user_id: int, thread_id: int, start_msg_id: Optional[int] = None):
+        self.user_id = user_id
+        self.thread_id = thread_id
+        self.start_msg_id = start_msg_id
+        self.answers: dict[str, str | list[str]] = {}
 
-CB_CHOICES        = ["Easy", "Normal", "Hard", "Brutal", "NM", "UNM"]
-HYDRA_CHOICES     = ["Normal", "Hard", "Brutal", "NM"]
-CHIMERA_CHOICES   = ["Easy", "Normal", "Hard", "Brutal", "NM", "UNM"]
-PLAYSTYLE_CHOICES = ["stress-free", "Casual", "Semi Competitive", "Competitive"]
+        # gate flags
+        self.done_basic = False
+        self.chosen_playstyle = False
+        self.have_cb = False
+        self.have_hydra_levels = False
+        self.have_hydra_nums = False
+        self.have_chimera_levels = False
+        self.have_chimera_nums = False
+        self.have_siege = False
+        self.have_cvc_interest = False
+        self.have_cvc_points = False
+        self.have_cvc_style = False
+        self.have_ref = False
 
-class ClanMatchView(discord.ui.View):
-    """4 selects + one row of buttons (CvC, Siege, Roster, Reset, Search)."""
-    def __init__(self, author_id: int):
-        super().__init__(timeout=1800)  # 30 min
-        self.author_id = author_id
-        self.cb = None; self.hydra = None; self.chimera = None; self.playstyle = None
-        self.cvc = None; self.siege = None
-        self.roster_mode: str | None = None   # None = All, 'open' = Spots > 0, 'full' = Spots <= 0
-        self.message: discord.Message | None = None  # set after sending
+_sessions: dict[int, Session] = {}             # user_id -> Session
+_thread_locks: dict[int, int] = {}             # thread_id -> applicant_user_id
+_thread_prompt_msg_id: dict[int, int] = {}     # thread_id -> start message id
 
-    # on-timeout: disable + mark expired
-    async def on_timeout(self):
-        for child in self.children:
-            child.disabled = True
-        try:
-            if self.message:
-                expired = discord.Embed(
-                    title="Find a C1C Clan",
-                    description="⏳ Panel expired. Run `!clanmatch` to open a fresh one."
-                )
-                await self.message.edit(embed=expired, view=self)
-        except Exception as e:
-            print("[view timeout] failed to edit:", e)
+# ---------- Embeds ----------
+def start_embed(mention: Optional[str]) -> discord.Embed:
+    e = discord.Embed(
+        title="C1C Application",
+        description=(f"Hey {mention or 'there'}! ✨\n"
+                     "Tap **Start** to begin. This panel is **locked to you**."),
+        color=COLOR_PRIMARY
+    )
+    e.set_footer(text="Mobile/desktop friendly • Answers will post here in-thread")
+    return e
 
-    # visual sync so selects and toggles reflect current state
-    def _sync_visuals(self):
-        for child in self.children:
-            if isinstance(child, discord.ui.Select):
-                chosen = None
-                ph = (child.placeholder or "")
-                if "CB Difficulty" in ph: chosen = self.cb
-                elif "Hydra Difficulty" in ph: chosen = self.hydra
-                elif "Chimera Difficulty" in ph: chosen = self.chimera
-                elif "Playstyle" in ph: chosen = self.playstyle
-                for opt in child.options:
-                    opt.default = (chosen is not None and opt.value == chosen)
-            elif isinstance(child, discord.ui.Button):
-                if child.label.startswith("CvC:"):
-                    child.label = self._toggle_label("CvC", self.cvc)
-                    child.style = discord.ButtonStyle.success if self.cvc == "1" else (
-                        discord.ButtonStyle.danger if self.cvc == "0" else discord.ButtonStyle.secondary
-                    )
-                elif child.label.startswith("Siege:"):
-                    child.label = self._toggle_label("Siege", self.siege)
-                    child.style = discord.ButtonStyle.success if self.siege == "1" else (
-                        discord.ButtonStyle.danger if self.siege == "0" else discord.ButtonStyle.secondary
-                    )
-                elif child.custom_id == "roster_btn":
-                    if self.roster_mode is None:
-                        child.label = "Roster: All"
-                        child.style = discord.ButtonStyle.secondary
-                    elif self.roster_mode == "open":
-                        child.label = "Roster: Open only"
-                        child.style = discord.ButtonStyle.success
-                    else:  # 'full'
-                        child.label = "Roster: Full only"
-                        child.style = discord.ButtonStyle.primary
-
-    async def interaction_check(self, itx: discord.Interaction) -> bool:
-        if itx.user.id != self.author_id:
-            await itx.response.send_message("This panel isn’t yours—run `!clanmatch` to get your own. 🙂", ephemeral=True)
-            return False
-        return True
-
-    # Row 0–3: selects
-    @discord.ui.select(placeholder="CB Difficulty (optional)", min_values=0, max_values=1, row=0,
-                       options=[discord.SelectOption(label=o, value=o) for o in CB_CHOICES])
-    async def cb_select(self, itx: discord.Interaction, select: discord.ui.Select):
-        self.cb = select.values[0] if select.values else None
-        await itx.response.defer()
-
-    @discord.ui.select(placeholder="Hydra Difficulty (optional)", min_values=0, max_values=1, row=1,
-                       options=[discord.SelectOption(label=o, value=o) for o in HYDRA_CHOICES])
-    async def hydra_select(self, itx: discord.Interaction, select: discord.ui.Select):
-        self.hydra = select.values[0] if select.values else None
-        await itx.response.defer()
-
-    @discord.ui.select(placeholder="Chimera Difficulty (optional)", min_values=0, max_values=1, row=2,
-                       options=[discord.SelectOption(label=o, value=o) for o in CHIMERA_CHOICES])
-    async def chimera_select(self, itx: discord.Interaction, select: discord.ui.Select):
-        self.chimera = select.values[0] if select.values else None
-        await itx.response.defer()
-
-    @discord.ui.select(placeholder="Playstyle (optional)", min_values=0, max_values=1, row=3,
-                       options=[discord.SelectOption(label=o, value=o) for o in PLAYSTYLE_CHOICES])
-    async def playstyle_select(self, itx: discord.Interaction, select: discord.ui.Select):
-        self.playstyle = select.values[0] if select.values else None
-        await itx.response.defer()
-
-    # Row 4: buttons
-    def _cycle(self, current):
-        return "1" if current is None else ("0" if current == "1" else None)
-    def _toggle_label(self, name, value):
-        state = "—" if value is None else ("Yes" if value == "1" else "No")
-        return f"{name}: {state}"
-
-    @discord.ui.button(label="CvC: —", style=discord.ButtonStyle.secondary, row=4)
-    async def toggle_cvc(self, itx: discord.Interaction, button: discord.ui.Button):
-        self.cvc = self._cycle(self.cvc); self._sync_visuals()
-        try:    await itx.response.edit_message(view=self)
-        except InteractionResponded:
-                await itx.followup.edit_message(message_id=itx.message.id, view=self)
-
-    @discord.ui.button(label="Siege: —", style=discord.ButtonStyle.secondary, row=4)
-    async def toggle_siege(self, itx: discord.Interaction, button: discord.ui.Button):
-        self.siege = self._cycle(self.siege); self._sync_visuals()
-        try:    await itx.response.edit_message(view=self)
-        except InteractionResponded:
-                await itx.followup.edit_message(message_id=itx.message.id, view=self)
-
-    @discord.ui.button(label="Roster: All", style=discord.ButtonStyle.secondary, row=4, custom_id="roster_btn")
-    async def toggle_roster(self, itx: discord.Interaction, button: discord.ui.Button):
-        # Cycle: None -> 'open' -> 'full' -> None
-        if self.roster_mode is None:
-            self.roster_mode = "open"
-        elif self.roster_mode == "open":
-            self.roster_mode = "full"
-        else:
-            self.roster_mode = None
-        self._sync_visuals()
-        try:    await itx.response.edit_message(view=self)
-        except InteractionResponded:
-            await itx.followup.edit_message(message_id=itx.message.id, view=self)
-
-    @discord.ui.button(label="Reset", style=discord.ButtonStyle.secondary, row=4)
-    async def reset_filters(self, itx: discord.Interaction, _btn: discord.ui.Button):
-        self.cb = self.hydra = self.chimera = self.playstyle = None
-        self.cvc = self.siege = None
-        self.roster_mode = None
-        self._sync_visuals()
-        try:    await itx.response.edit_message(view=self)
-        except InteractionResponded:
-            await itx.followup.edit_message(message_id=itx.message.id, view=self)
-
-    @discord.ui.button(label="Search Clans", style=discord.ButtonStyle.primary, row=4)
-    async def search(self, itx: discord.Interaction, _btn: discord.ui.Button):
-        # Require at least one filter (including roster mode)
-        if not any([
-            self.cb, self.hydra, self.chimera, self.cvc, self.siege, self.playstyle,
-            self.roster_mode is not None
-        ]):
-            await itx.response.send_message("Pick at least **one** filter, then try again. 🙂")
-            return
-
-        await itx.response.defer(thinking=True)  # public results
-        try:
-            rows = get_rows(force=False)
-        except Exception as e:
-            await itx.followup.send(f"❌ Failed to read sheet: {e}")
-            return
-
-        matches = []
-        for row in rows[1:]:
-            try:
-                if is_header_row(row):
-                    continue
-                if row_matches(row, self.cb, self.hydra, self.chimera, self.cvc, self.siege, self.playstyle):
-                    spots_num = parse_spots_num(row[COL_E_SPOTS])
-                    if self.roster_mode == "open" and spots_num <= 0:
-                        continue
-                    if self.roster_mode == "full" and spots_num > 0:
-                        continue
-                    matches.append(row)
-            except Exception:
-                continue
-
-        if not matches:
-            await itx.followup.send("No matching clans found. Try a different combo.")
-            return
-
-        filters_text = format_filters_footer(
-            self.cb, self.hydra, self.chimera, self.cvc, self.siege, self.playstyle, self.roster_mode
-        )
-        for i in range(0, len(matches), 10):
-            chunk = matches[i:i+10]
-            embeds = [make_embed_for_row(r, filters_text) for r in chunk]
-            await itx.followup.send(embeds=embeds)
-
-# ------------------- Commands -------------------
-@commands.cooldown(1, 2, commands.BucketType.user)
-@bot.command(name="clanmatch")
-async def clanmatch_cmd(ctx: commands.Context):
-    now = time.time()
-    if now - LAST_CALL.get(ctx.author.id, 0) < COOLDOWN_SEC:
-        return
-    LAST_CALL[ctx.author.id] = now
-
-    view = ClanMatchView(author_id=ctx.author.id)
-    view._sync_visuals()
-
-    embed = discord.Embed(
-        title="Find a C1C Clan for your recruit",
-        description=(
-            "Pick any filters (you can leave some blank) and click **Search Clans**.\n"
-            "**Tip:** choose the most important criteria for your recruit — *but don’t go overboard*. "
-            "Too many filters might narrow things down to zero."
-        )
+def submitted_embed(mention: str) -> discord.Embed:
+    return discord.Embed(
+        title="Application started",
+        description=f"Thanks, {mention}! Your answers are posted below. A recruiter will follow up here.",
+        color=COLOR_SUCCESS
     )
 
-    # Try to edit your previous panel in place; if not found, send a new one
-    old_id = ACTIVE_PANELS.get(ctx.author.id)
-    if old_id:
+def step_embed(title: str, hints: str = "") -> discord.Embed:
+    e = discord.Embed(title=title, color=COLOR_PRIMARY)
+    if hints:
+        e.description = hints
+    return e
+
+def summary_embed(user: discord.User, a: dict) -> discord.Embed:
+    e = discord.Embed(
+        title="C1C Match Application",
+        description=f"Applicant: {user.mention} (`{user.name}`)",
+        color=COLOR_PRIMARY
+    )
+    def F(name, key, default="—"):
+        val = a.get(key, default)
+        if isinstance(val, list):
+            val = ", ".join(val) if val else default
+        sval = str(val).strip()
+        if len(sval) > 900: sval = sval[:897] + "…"
+        e.add_field(name=f"🔹 {name}", value=sval or default, inline=False)
+
+    F("In-game name", "ign")
+    F("Account level", "acc_level")
+    F("Clan style (what you want)", "clan_style")
+    F("Playstyle", "playstyle")
+    F("Clan Boss — Level", "cb_level")
+    F("Clan Boss — Damage", "cb_damage")
+    F("Hydra — Levels", "hydra_levels")
+    F("Hydra — Damage", "hydra_damage")
+    F("Hydra — Clashpoints", "hydra_clash")
+    F("Chimera — Levels", "chimera_levels")
+    F("Chimera — Damage", "chimera_damage")
+    F("Chimera — Clashpoints", "chimera_clash")
+    F("Siege — Interested?", "siege_interest")
+    F("Siege — Teams prepared?", "siege_teams")
+    F("CvC — Interested?", "cvc_interest")
+    F("CvC — Min points (guarantee)", "cvc_min")
+    F("CvC — Style", "cvc_style")
+    F("Who sent you? How did you find us?", "ref")
+    e.set_footer(text="Tip: Ping a Recruitment Coordinator to start matching.")
+    return e
+
+# ---------- Modals ----------
+class BasicInfoModal(discord.ui.Modal, title="Application — Basics"):
+    ign = discord.ui.TextInput(label="In-game player name", style=discord.TextStyle.short, max_length=64, required=True)
+    acc_level = discord.ui.TextInput(label="Account level", placeholder="e.g., 72", style=discord.TextStyle.short, max_length=8, required=True)
+    clan_style = discord.ui.TextInput(label="Clan style — what’s important to you?", style=discord.TextStyle.paragraph, max_length=500, required=True)
+    def __init__(self, sess: Session): super().__init__(); self.sess = sess
+    async def on_submit(self, itx: discord.Interaction):
+        if itx.user.id != self.sess.user_id:
+            return await itx.response.send_message("Locked to the applicant. Use `/apply` for your own.", ephemeral=True)
+        lvl = self.acc_level.value.strip()
+        if not re.fullmatch(r"\d{1,3}", lvl):
+            return await itx.response.send_message("Enter a numeric **account level** (e.g., 72).", ephemeral=True)
+        self.sess.answers["ign"] = self.ign.value.strip()
+        self.sess.answers["acc_level"] = lvl
+        self.sess.answers["clan_style"] = self.clan_style.value.strip()
+        self.sess.done_basic = True
+        await itx.response.send_message("Saved basics ✔️", ephemeral=True)
+
+class CBDamageModal(discord.ui.Modal, title="Clan Boss — Damage"):
+    cb_damage = discord.ui.TextInput(label="Damage", placeholder="e.g., 200M on UNM", style=discord.TextStyle.short, max_length=48, required=True)
+    def __init__(self, sess: Session): super().__init__(); self.sess = sess
+    async def on_submit(self, itx: discord.Interaction):
+        if itx.user.id != self.sess.user_id:
+            return await itx.response.send_message("Locked to applicant.", ephemeral=True)
+        self.sess.answers["cb_damage"] = self.cb_damage.value.strip()
+        self.sess.have_cb = True
+        await itx.response.send_message("Saved CB damage ✔️", ephemeral=True)
+
+class HydraNumsModal(discord.ui.Modal, title="Hydra — Numbers"):
+    hydra_damage = discord.ui.TextInput(label="Damage", placeholder="e.g., 20M per key", style=discord.TextStyle.short, max_length=48, required=True)
+    hydra_clash  = discord.ui.TextInput(label="Clashpoints (guarantee)", placeholder="e.g., 50k", style=discord.TextStyle.short, max_length=48, required=True)
+    def __init__(self, sess: Session): super().__init__(); self.sess = sess
+    async def on_submit(self, itx: discord.Interaction):
+        if itx.user.id != self.sess.user_id:
+            return await itx.response.send_message("Locked to applicant.", ephemeral=True)
+        self.sess.answers["hydra_damage"] = self.hydra_damage.value.strip()
+        self.sess.answers["hydra_clash"]  = self.hydra_clash.value.strip()
+        self.sess.have_hydra_nums = True
+        await itx.response.send_message("Saved Hydra numbers ✔️", ephemeral=True)
+
+class ChimeraNumsModal(discord.ui.Modal, title="Chimera — Numbers"):
+    chimera_damage = discord.ui.TextInput(label="Damage", placeholder="e.g., 6M on Hard", style=discord.TextStyle.short, max_length=48, required=True)
+    chimera_clash  = discord.ui.TextInput(label="Clashpoints (guarantee)", placeholder="e.g., 50k", style=discord.TextStyle.short, max_length=48, required=True)
+    def __init__(self, sess: Session): super().__init__(); self.sess = sess
+    async def on_submit(self, itx: discord.Interaction):
+        if itx.user.id != self.sess.user_id:
+            return await itx.response.send_message("Locked to applicant.", ephemeral=True)
+        self.sess.answers["chimera_damage"] = self.chimera_damage.value.strip()
+        self.sess.answers["chimera_clash"]  = self.chimera_clash.value.strip()
+        self.sess.have_chimera_nums = True
+        await itx.response.send_message("Saved Chimera numbers ✔️", ephemeral=True)
+
+class CvCPointsModal(discord.ui.Modal, title="CvC — Minimum points"):
+    cvc_min = discord.ui.TextInput(label="Minimum points you can commit", placeholder="e.g., 100000", style=discord.TextStyle.short, max_length=12, required=True)
+    def __init__(self, sess: Session): super().__init__(); self.sess = sess
+    async def on_submit(self, itx: discord.Interaction):
+        if itx.user.id != self.sess.user_id:
+            return await itx.response.send_message("Locked to applicant.", ephemeral=True)
+        pts = self.cvc_min.value.strip().replace(",", "")
+        if not re.fullmatch(r"\d{1,9}", pts):
+            return await itx.response.send_message("Digits only for CvC points (e.g., 100000).", ephemeral=True)
+        self.sess.answers["cvc_min"] = pts
+        self.sess.have_cvc_points = True
+        await itx.response.send_message("Saved CvC points ✔️", ephemeral=True)
+
+class ReferralModal(discord.ui.Modal, title="Who sent you? How did you find us?"):
+    ref = discord.ui.TextInput(label="Referral / how you found us", style=discord.TextStyle.paragraph, max_length=300, required=True)
+    def __init__(self, sess: Session): super().__init__(); self.sess = sess
+    async def on_submit(self, itx: discord.Interaction):
+        if itx.user.id != self.sess.user_id:
+            return await itx.response.send_message("Locked to applicant.", ephemeral=True)
+        self.sess.answers["ref"] = self.ref.value.strip()
+        self.sess.have_ref = True
+        await itx.response.send_message("Saved referral ✔️", ephemeral=True)
+
+# ---------- Selects ----------
+def locked(itx: discord.Interaction, sess: Session) -> bool:
+    if itx.user.id != sess.user_id:
+        asyncio.create_task(itx.response.send_message("This panel is locked to the applicant.", ephemeral=True))
+        return True
+    return False
+
+class PlaystyleSelect(discord.ui.Select):
+    def __init__(self, sess: Session):
+        opts = [discord.SelectOption(label=o) for o in ["stress-free", "casual", "semi-competitive", "competitive"]]
+        super().__init__(placeholder="Choose your playstyle", min_values=1, max_values=1, options=opts)
+        self.sess = sess
+    async def callback(self, itx: discord.Interaction):
+        if locked(itx, self.sess): return
+        self.sess.answers["playstyle"] = self.values[0]
+        self.sess.chosen_playstyle = True
+        await itx.response.send_message(f"Playstyle set to **{self.values[0]}** ✔️", ephemeral=True)
+
+class CBLevelSelect(discord.ui.Select):
+    def __init__(self, sess: Session):
+        opts = [discord.SelectOption(label=o) for o in ["Easy","Normal","Hard","Brutal","Nightmare","Ultra-Nightmare"]]
+        super().__init__(placeholder="Clan Boss level", min_values=1, max_values=1, options=opts)
+        self.sess = sess
+    async def callback(self, itx: discord.Interaction):
+        if locked(itx, self.sess): return
+        self.sess.answers["cb_level"] = self.values[0]
+        await itx.response.send_message(f"CB level set to **{self.values[0]}** ✔️", ephemeral=True)
+
+class HydraLevelsSelect(discord.ui.Select):
+    def __init__(self, sess: Session):
+        opts = [discord.SelectOption(label=o) for o in ["Easy","Normal","Hard","Brutal","Nightmare"]]
+        super().__init__(placeholder="Hydra levels (up to 3)", min_values=1, max_values=3, options=opts)
+        self.sess = sess
+    async def callback(self, itx: discord.Interaction):
+        if locked(itx, self.sess): return
+        self.sess.answers["hydra_levels"] = self.values
+        self.sess.have_hydra_levels = True
+        await itx.response.send_message(f"Hydra levels: **{', '.join(self.values)}** ✔️", ephemeral=True)
+
+class ChimeraLevelsSelect(discord.ui.Select):
+    def __init__(self, sess: Session):
+        opts = [discord.SelectOption(label=o) for o in ["Easy","Normal","Hard","Brutal","Nightmare","Ultra-Nightmare"]]
+        super().__init__(placeholder="Chimera levels (up to 2)", min_values=1, max_values=2, options=opts)
+        self.sess = sess
+    async def callback(self, itx: discord.Interaction):
+        if locked(itx, self.sess): return
+        self.sess.answers["chimera_levels"] = self.values
+        self.sess.have_chimera_levels = True
+        await itx.response.send_message(f"Chimera levels: **{', '.join(self.values)}** ✔️", ephemeral=True)
+
+class YesNoSelect(discord.ui.Select):
+    def __init__(self, placeholder: str, key: str, sess: Session):
+        super().__init__(placeholder=placeholder, min_values=1, max_values=1,
+                         options=[discord.SelectOption(label="yes"), discord.SelectOption(label="no")])
+        self.key, self.sess = key, sess
+    async def callback(self, itx: discord.Interaction):
+        if locked(itx, self.sess): return
+        self.sess.answers[self.key] = self.values[0]
+        if self.key == "siege_interest": self.sess.have_siege = True
+        if self.key == "cvc_interest": self.sess.have_cvc_interest = True
+        await itx.response.send_message(f"{self.placeholder}: **{self.values[0]}** ✔️", ephemeral=True)
+
+class CvCStyleSelect(discord.ui.Select):
+    def __init__(self, sess: Session):
+        super().__init__(placeholder="CvC style", min_values=1, max_values=1,
+                         options=[discord.SelectOption(label=o) for o in ["competitive","rather chill","don’t care about CvC"]])
+        self.sess = sess
+    async def callback(self, itx: discord.Interaction):
+        if locked(itx, self.sess): return
+        self.sess.answers["cvc_style"] = self.values[0]
+        self.sess.have_cvc_style = True
+        await itx.response.send_message(f"CvC style: **{self.values[0]}** ✔️", ephemeral=True)
+
+# ---------- Views (per step) ----------
+class StartApplyView(discord.ui.View):
+    def __init__(self, applicant_id: Optional[int], thread_id: int, disabled: bool = False):
+        super().__init__(timeout=3600)
+        self.applicant_id = applicant_id
+        self.thread_id = thread_id
+        for c in self.children:
+            if isinstance(c, discord.ui.Button):
+                c.disabled = disabled
+
+    @discord.ui.button(label="Start", style=discord.ButtonStyle.primary, custom_id="start_apply_btn")
+    async def start(self, itx: discord.Interaction, btn: discord.ui.Button):
+        # lock to opener
+        locked_uid = _thread_locks.get(self.thread_id)
+        if locked_uid is None:
+            _thread_locks[self.thread_id] = self.applicant_id or itx.user.id
+            locked_uid = _thread_locks[self.thread_id]
+        if itx.user.id != locked_uid:
+            return await itx.response.send_message("Locked to the applicant. Use `/apply` for your own.", ephemeral=True)
+
+        sess = _sessions.get(itx.user.id)
+        if not sess:
+            sess = Session(itx.user.id, self.thread_id, start_msg_id=_thread_prompt_msg_id.get(self.thread_id))
+            _sessions[itx.user.id] = sess
+
+        await itx.response.send_message("Starting…", ephemeral=True)
+        thread = itx.channel
+        e = step_embed("Step 1 — Basics", "Fill basics (modal) and choose your **Playstyle**. Then press **Next**.")
+        await thread.send(embed=e, view=Step1View(sess))
+
+class Step1View(discord.ui.View):
+    def __init__(self, sess: Session):
+        super().__init__(timeout=1800)
+        self.sess = sess
+        self.add_item(PlaystyleSelect(sess))
+
+    @discord.ui.button(label="Fill basics", style=discord.ButtonStyle.secondary)
+    async def basics(self, itx: discord.Interaction, _: discord.ui.Button):
+        if locked(itx, self.sess): return
+        await itx.response.send_modal(BasicInfoModal(self.sess))
+
+    @discord.ui.button(label="Next ➜", style=discord.ButtonStyle.primary)
+    async def next(self, itx: discord.Interaction, _: discord.ui.Button):
+        if locked(itx, self.sess): return
+        if not (self.sess.done_basic and self.sess.chosen_playstyle):
+            return await itx.response.send_message("Finish **Basics** and choose **Playstyle** first.", ephemeral=True)
+        await itx.response.send_message("On to Step 2…", ephemeral=True)
+        thread = itx.channel
+        e = step_embed(
+            "Step 2 — Bosses",
+            "Pick **CB level**, **Hydra levels (≤3)**, **Chimera levels (≤2)**, then enter **damage/clashpoints**. Press **Next**."
+        )
+        await thread.send(embed=e, view=Step2View(self.sess))
+
+class Step2View(discord.ui.View):
+    def __init__(self, sess: Session):
+        super().__init__(timeout=1800)
+        self.sess = sess
+        self.add_item(CBLevelSelect(sess))
+        self.add_item(HydraLevelsSelect(sess))
+        self.add_item(ChimeraLevelsSelect(sess))
+
+    @discord.ui.button(label="Enter CB damage", style=discord.ButtonStyle.secondary)
+    async def cb(self, itx: discord.Interaction, _: discord.ui.Button):
+        if locked(itx, self.sess): return
+        await itx.response.send_modal(CBDamageModal(self.sess))
+
+    @discord.ui.button(label="Hydra damage & clash", style=discord.ButtonStyle.secondary)
+    async def hydra(self, itx: discord.Interaction, _: discord.ui.Button):
+        if locked(itx, self.sess): return
+        await itx.response.send_modal(HydraNumsModal(self.sess))
+
+    @discord.ui.button(label="Chimera damage & clash", style=discord.ButtonStyle.secondary)
+    async def chimera(self, itx: discord.Interaction, _: discord.ui.Button):
+        if locked(itx, self.sess): return
+        await itx.response.send_modal(ChimeraNumsModal(self.sess))
+
+    @discord.ui.button(label="Next ➜", style=discord.ButtonStyle.primary)
+    async def next(self, itx: discord.Interaction, _: discord.ui.Button):
+        if locked(itx, self.sess): return
+        ok = all([
+            "cb_level" in self.sess.answers,
+            self.sess.have_cb,
+            self.sess.have_hydra_levels,
+            self.sess.have_hydra_nums,
+            self.sess.have_chimera_levels,
+            self.sess.have_chimera_nums
+        ])
+        if not ok:
+            return await itx.response.send_message("Complete CB level+damage, Hydra levels+numbers, Chimera levels+numbers.", ephemeral=True)
+        await itx.response.send_message("On to Step 3…", ephemeral=True)
+        thread = itx.channel
+        e = step_embed(
+            "Step 3 — Siege, CvC & Referral",
+            "Answer **Siege** (interest + teams), **CvC** (interest + min points + style), and **Who sent you?** Then **Submit**."
+        )
+        await thread.send(embed=e, view=Step3View(self.sess))
+
+class Step3View(discord.ui.View):
+    def __init__(self, sess: Session):
+        super().__init__(timeout=1800)
+        self.sess = sess
+        self.add_item(YesNoSelect("Siege — interested?", "siege_interest", sess))
+        self.add_item(YesNoSelect("Siege — teams prepared?", "siege_teams", sess))
+        self.add_item(YesNoSelect("CvC — interested?", "cvc_interest", sess))
+        self.add_item(CvCStyleSelect(sess))
+
+    @discord.ui.button(label="Enter CvC points", style=discord.ButtonStyle.secondary)
+    async def cvc_pts(self, itx: discord.Interaction, _: discord.ui.Button):
+        if locked(itx, self.sess): return
+        await itx.response.send_modal(CvCPointsModal(self.sess))
+
+    @discord.ui.button(label="Who sent you? (modal)", style=discord.ButtonStyle.secondary)
+    async def referral(self, itx: discord.Interaction, _: discord.ui.Button):
+        if locked(itx, self.sess): return
+        await itx.response.send_modal(ReferralModal(self.sess))
+
+    @discord.ui.button(label="Submit ✅", style=discord.ButtonStyle.success)
+    async def submit(self, itx: discord.Interaction, _: discord.ui.Button):
+        if locked(itx, self.sess): return
+        ok = all([
+            "siege_interest" in self.sess.answers,
+            "siege_teams" in self.sess.answers,
+            "cvc_interest" in self.sess.answers,
+            "cvc_min" in self.sess.answers,
+            "cvc_style" in self.sess.answers,
+            "ref" in self.sess.answers
+        ])
+        if not ok:
+            return await itx.response.send_message("Please finish Siege, CvC (points + style), and Referral.", ephemeral=True)
+
+        await itx.response.send_message("Posting your application…", ephemeral=True)
+        thread = itx.channel
+        emb = summary_embed(itx.user, self.sess.answers)
+        ping = f"{itx.user.mention} " + (f"<@&{RECRUITER_ROLE_ID}>" if RECRUITER_ROLE_ID else "")
+        await thread.send(content=ping.strip(), embed=emb)
+
+        # Flip Start card to "Application started"
+        start_id = self.sess.start_msg_id or _thread_prompt_msg_id.get(thread.id)
+        if start_id:
+            try:
+                msg = await thread.fetch_message(start_id)
+                v = StartApplyView(applicant_id=self.sess.user_id, thread_id=self.sess.thread_id, disabled=True)
+                await msg.edit(embed=submitted_embed(itx.user.mention), view=v)
+            except Exception:
+                pass
+
+        _sessions.pop(self.sess.user_id, None)
+
+# ---------- Applicant guessing + thread watcher ----------
+async def guess_applicant_from_thread(thread: discord.Thread) -> Optional[discord.Member]:
+    try: await thread.join()
+    except: pass
+
+    async for msg in thread.history(limit=5, oldest_first=True):
+        if TICKET_TOOL_BOT_ID and msg.author.id != TICKET_TOOL_BOT_ID:
+            continue
+        for u in msg.mentions:
+            if not u.bot and isinstance(u, discord.Member):
+                return u
+
+    if thread.name and re.match(THREAD_NAME_REGEX, thread.name):
+        after = thread.name.split("-", 1)[1].strip()
+        for mem in thread.guild.members:
+            if mem.name == after or mem.display_name == after:
+                return mem
+        after_lower = after.lower()
+        for mem in thread.guild.members:
+            if mem.name.lower() == after_lower or mem.display_name.lower() == after_lower:
+                return mem
+    return None
+
+@bot.event
+async def on_thread_create(thread: discord.Thread):
+    if not thread.parent or thread.parent.id != WELCOME_CHANNEL_ID: return
+    if not re.match(THREAD_NAME_REGEX, thread.name or ""): return
+
+    applicant = await guess_applicant_from_thread(thread)
+    mention = applicant.mention if applicant else None
+    view = StartApplyView(applicant_id=(applicant.id if applicant else None), thread_id=thread.id)
+
+    try: await thread.join()
+    except: pass
+
+    try:
+        m = await thread.send(embed=start_embed(mention), view=view)
+        _thread_prompt_msg_id[thread.id] = m.id
+    except discord.Forbidden:
+        await thread.parent.send(f"Couldn’t post in **{thread.name}**. Check bot thread permissions.")
+
+# ---------- Google Sheets helpers ----------
+def _get_ws():
+    if not GSHEET_ID: return None
+    raw = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
+    if not raw: return None
+    sa_info = json.loads(raw)
+    gc = gspread.service_account_from_dict(sa_info)
+    sh = gc.open_by_key(GSHEET_ID)
+    if GSHEET_WORKSHEET:
         try:
-            msg = await ctx.channel.fetch_message(old_id)
-            view.message = msg
-            await msg.edit(embed=embed, view=view)
-            return
+            return sh.worksheet(GSHEET_WORKSHEET)
+        except gspread.WorksheetNotFound:
+            ws = sh.add_worksheet(GSHEET_WORKSHEET, rows=1000, cols=10)
+            ws.append_row(["ticket number","username","clantag","date closed"])
+            return ws
+    else:
+        ws = sh.sheet1
+        try:
+            head = ws.row_values(1)
+            if not head or [h.lower() for h in head][:4] != ["ticket number","username","clantag","date closed"]:
+                ws.insert_row(["ticket number","username","clantag","date closed"], 1)
+        except Exception:
+            pass
+        return ws
+
+def _now_str():
+    if ZoneInfo:
+        tz = ZoneInfo(TIMEZONE) if TIMEZONE else ZoneInfo("UTC")
+        return datetime.now(tz).strftime("%Y-%m-%d %H:%M")
+    return datetime.utcnow().strftime("%Y-%m-%d %H:%M")
+
+def _parse_closed_name(name: str):
+    m = re.match(r"(?i)closed-(\d{3,6})-([^-]+)", name or "")
+    if not m: return None, None
+    return m.group(1), m.group(2).strip()
+
+# ---------- Placement prompt on Ticket Close ----------
+_pending_close: dict[int, int] = {}      # thread_id -> closer_user_id
+_close_prompt_msg: dict[int, int] = {}   # thread_id -> message id
+
+class ClanTagModal(discord.ui.Modal, title="Set placement clan tag"):
+    tag = discord.ui.TextInput(label="Clan tag", placeholder="e.g., C1CM", max_length=16, required=True)
+    def __init__(self, thread_id: int, closer_id: int): super().__init__(); self.thread_id = thread_id; self.closer_id = closer_id
+    async def on_submit(self, itx: discord.Interaction):
+        if itx.user.id != self.closer_id:
+            return await itx.response.send_message("Locked to the closer of this ticket.", ephemeral=True)
+        await _finalize_tag(itx, self.thread_id, self.closer_id, self.tag.value)
+
+class ClanTagSelect(discord.ui.Select):
+    def __init__(self, thread_id: int, closer_id: int):
+        opts = [discord.SelectOption(label=t) for t in CLAN_TAGS]
+        opts.append(discord.SelectOption(label="Custom…", description="Type a custom tag"))
+        super().__init__(placeholder="Select clan tag", min_values=1, max_values=1, options=opts)
+        self.thread_id = thread_id; self.closer_id = closer_id
+    async def callback(self, itx: discord.Interaction):
+        if itx.user.id != self.closer_id:
+            return await itx.response.send_message("Locked to the closer of this ticket.", ephemeral=True)
+        if self.values[0].lower().startswith("custom"):
+            return await itx.response.send_modal(ClanTagModal(self.thread_id, self.closer_id))
+        await _finalize_tag(itx, self.thread_id, self.closer_id, self.values[0])
+
+class ClanTagView(discord.ui.View):
+    def __init__(self, thread_id: int, closer_id: int):
+        super().__init__(timeout=1800)
+        self.add_item(ClanTagSelect(thread_id, closer_id))
+
+async def _finalize_tag(itx: discord.Interaction, thread_id: int, closer_id: int, raw_tag: str):
+    tag = re.sub(r"[^A-Za-z0-9_-]+", "", raw_tag).upper()
+    thread = itx.client.get_channel(thread_id)
+    if not isinstance(thread, discord.Thread):
+        return await itx.response.send_message("Could not find the ticket thread.", ephemeral=True)
+
+    # Rename: append "-TAG" if not present
+    new_name = thread.name
+    if not re.search(rf"(?i)-{re.escape(tag)}$", new_name or ""):
+        new_name = f"{new_name}-{tag}"
+        try:
+            await thread.edit(name=new_name, reason=f"Placement set by {itx.user}")
+        except discord.Forbidden:
+            return await itx.response.send_message("Missing permission to rename this thread (Manage Channels).", ephemeral=True)
+
+    # Log to Google Sheet
+    ws = _get_ws()
+    ticket, uname = _parse_closed_name(thread.name)
+    if ws:
+        try:
+            ws.append_row([ticket or "", uname or "", tag, _now_str()], value_input_option="USER_ENTERED")
+        except Exception as e:
+            print("Sheets append failed:", e)
+
+    # Flip prompt to green
+    msg_id = _close_prompt_msg.get(thread_id)
+    if msg_id:
+        try:
+            msg = await thread.fetch_message(msg_id)
+            done = discord.Embed(
+                title="Placement recorded",
+                description=f"Clan tag **{tag}** set.\nThread renamed to **{new_name}** and logged to the sheet.",
+                color=COLOR_SUCCESS
+            )
+            await msg.edit(embed=done, view=None)
         except Exception:
             pass
 
-    sent = await ctx.reply(embed=embed, view=view, mention_author=False)
-    view.message = sent
-    ACTIVE_PANELS[ctx.author.id] = sent.id
+    _pending_close.pop(thread_id, None)
+    await itx.response.send_message(f"Saved: **{tag}** ✔️", ephemeral=True)
 
-@clanmatch_cmd.error
-async def clanmatch_error(ctx, error):
-    if isinstance(error, commands.CommandOnCooldown):
-        return
+@bot.event
+async def on_message(message: discord.Message):
+    # Only care about Ticket Tool messages in threads
+    if not isinstance(message.channel, discord.Thread): return
+    if TICKET_TOOL_BOT_ID and message.author.id != TICKET_TOOL_BOT_ID: return
+    if not message.embeds: return
 
-@bot.command(name="ping")
-async def ping(ctx):
-    await ctx.send("✅ I’m alive and listening, captain!")
+    def _txt(e: discord.Embed):
+        return " | ".join([x for x in [e.title or "", e.description or "", (e.author.name if e.author else "")] if x])
+    merged = " ".join(_txt(e) for e in message.embeds).lower()
+    if "ticket closed" not in merged: return
 
-# Health (prefix)
-@bot.command(name="health", aliases=["status"])
-async def health_prefix(ctx: commands.Context):
-    """Lightweight health check with hard fail-safes."""
+    closer_id = None
+    if message.mentions:
+        closer_id = message.mentions[0].id
+    else:
+        m = re.search(r"<@!?(\d+)>", merged)
+        if m: closer_id = int(m.group(1))
+
+    # Ensure the thread looks like Closed-####-User already
+    if not re.match(r"(?i)closed-", message.channel.name or ""): return
+
+    _pending_close[message.channel.id] = closer_id or 0
+    prompt = discord.Embed(
+        title="Set placement clan",
+        description=(f"{f'<@{closer_id}>' if closer_id else 'Closer'}, select the **clan tag** "
+                     "the applicant joined. I’ll append it to the thread name and log it to the sheet.\n\n"
+                     "Example: `Closed-0298-Caillean` → `Closed-0298-Caillean-**C1CM**`"),
+        color=COLOR_WARN
+    )
     try:
+        m = await message.channel.send(embed=prompt, view=ClanTagView(message.channel.id, closer_id or 0))
+        _close_prompt_msg[message.channel.id] = m.id
+    except discord.Forbidden:
+        # Fallback DM
         try:
-            ws = get_ws(force=False)
-            _ = ws.row_values(1)  # tiny read
-            sheets_status = f"OK (`{WORKSHEET_NAME}`)"
-        except Exception as e:
-            sheets_status = f"ERROR: {type(e).__name__}"
+            if closer_id:
+                user = message.guild.get_member(closer_id) or await bot.fetch_user(closer_id)
+                dm = await user.create_dm()
+                link = f"https://discord.com/channels/{message.guild.id}/{message.channel.id}"
+                prompt.description += f"\n\nIf you can’t interact in-thread, click here: {link}"
+                m = await dm.send(embed=prompt, view=ClanTagView(message.channel.id, closer_id))
+                _close_prompt_msg[message.channel.id] = m.id
+        except Exception:
+            pass
 
-        latency_ms = round(bot.latency * 1000) if bot.latency is not None else -1
-        msg = f"🟢 Bot OK | Latency: {latency_ms} ms | Sheets: {sheets_status} | Uptime: {_fmt_uptime()}"
-        await ctx.reply(msg, mention_author=False)
-    except Exception as e:
-        await ctx.reply(f"⚠️ Health error: `{type(e).__name__}: {e}`", mention_author=False)
+# ---------- Backfill closed tickets to Google Sheets ----------
+def _extract_tag_from_thread_name(name: str) -> str:
+    m = re.match(r"(?i)closed-\d{3,6}-([^-]+)(?:-([A-Za-z0-9_]+))?$", name or "")
+    if m and m.group(2): return m.group(2).upper()
+    return ""
 
-# Reload cache
-@bot.command(name="reload")
-async def reload_cache(ctx):
-    clear_cache()
-    await ctx.send("♻️ Sheet cache cleared. Next search will fetch fresh data.")
-
-# Health (slash)
-@bot.tree.command(name="health", description="Bot & Sheets status")
-async def health_slash(itx: discord.Interaction):
-    await itx.response.defer(thinking=False, ephemeral=False)
+async def _find_closed_timestamp(thread: discord.Thread) -> str:
     try:
-        ws = get_ws(force=False)
-        _ = ws.row_values(1)
-        sheets_status = f"OK (`{WORKSHEET_NAME}`)"
-    except Exception as e:
-        sheets_status = f"ERROR: {e.__class__.__name__}"
-    latency_ms = int(bot.latency * 1000) if bot.latency else -1
-    await itx.followup.send(f"🟢 Bot OK | Latency: {latency_ms} ms | Sheets: {sheets_status} | Uptime: {_fmt_uptime()}")
+        async for msg in thread.history(limit=50, oldest_first=False):
+            if TICKET_TOOL_BOT_ID and msg.author.id != TICKET_TOOL_BOT_ID: continue
+            if msg.embeds:
+                for e in msg.embeds:
+                    text = " ".join(filter(None, [e.title, e.description, e.author.name if e.author else None])).lower()
+                    if "ticket closed" in text:
+                        return msg.created_at.strftime("%Y-%m-%d %H:%M")
+    except Exception:
+        pass
+    if getattr(thread, "archived_at", None):
+        return thread.archived_at.strftime("%Y-%m-%d %H:%M")
+    try:
+        last = [m async for m in thread.history(limit=1, oldest_first=False)]
+        if last: return last[0].created_at.strftime("%Y-%m-%d %H:%M")
+    except Exception:
+        pass
+    return thread.created_at.strftime("%Y-%m-%d %H:%M")
 
-# ------------------- Events -------------------
+async def _append_if_new(ticket: str, username: str, tag: str, date_closed: str) -> bool:
+    ws = _get_ws()
+    if not ws: return False
+    try:
+        colA = ws.col_values(1)  # ticket number
+        if any(c.strip() == ticket for c in colA[1:]):  # skip header
+            return False
+    except Exception:
+        pass
+    try:
+        ws.append_row([ticket, username, tag, date_closed], value_input_option="USER_ENTERED")
+        return True
+    except Exception as e:
+        print("Sheets append failed:", e)
+        return False
+
+async def _scan_threads_in_channel(channel: discord.TextChannel, max_threads: int = 0) -> tuple[int,int,int]:
+    added = skipped = scanned = 0
+    async def handle_thread(t: discord.Thread):
+        nonlocal added, skipped, scanned
+        if not re.match(r"(?i)closed-", t.name or ""): return
+        scanned += 1
+        try: await t.join()
+        except: pass
+        ticket, username = _parse_closed_name(t.name)
+        if not ticket: return
+        tag = _extract_tag_from_thread_name(t.name)
+        date_closed = await _find_closed_timestamp(t)
+        ok = await _append_if_new(ticket, username or "", tag, date_closed)
+        if ok: added += 1
+        else: skipped += 1
+        await asyncio.sleep(0.2)
+
+    for t in channel.threads:
+        await handle_thread(t)
+        if max_threads and scanned >= max_threads: return (added, skipped, scanned)
+
+    async for t in channel.archived_threads(limit=None, private=False):
+        await handle_thread(t)
+        if max_threads and scanned >= max_threads: return (added, skipped, scanned)
+
+    async for t in channel.archived_threads(limit=None, private=True):
+        await handle_thread(t)
+        if max_threads and scanned >= max_threads: return (added, skipped, scanned)
+
+    return (added, skipped, scanned)
+
+@bot.tree.command(name="backfill_tickets", description="Scan closed ticket threads and log them to the Google Sheet")
+@app_commands.describe(max_threads="Max threads to scan (0 = all)")
+async def backfill_tickets(itx: discord.Interaction, max_threads: int = 0):
+    await itx.response.defer(ephemeral=True, thinking=True)
+    channel = bot.get_channel(WELCOME_CHANNEL_ID)
+    if channel is None or not isinstance(channel, discord.TextChannel):
+        return await itx.followup.send("WELCOME_CHANNEL_ID is not a text channel I can see.", ephemeral=True)
+    added, skipped, scanned = await _scan_threads_in_channel(channel, max_threads=max_threads)
+    await itx.followup.send(f"Backfill complete. Scanned **{scanned}**, added **{added}**, skipped **{skipped}**.", ephemeral=True)
+
+# ---------- Optional manual command ----------
+@bot.tree.command(name="apply", description="Start the C1C application wizard here")
+async def apply_cmd(itx: discord.Interaction):
+    uid = itx.user.id
+    if uid in _sessions:
+        return await itx.response.send_message("You already have an active application.", ephemeral=True)
+    thread_id = itx.channel.id if isinstance(itx.channel, discord.Thread) else 0
+    _sessions[uid] = Session(uid, thread_id)
+    await itx.response.send_message("Sent **Step 1** above. If nothing appears, run this inside your ticket thread.", ephemeral=True)
+
 @bot.event
 async def on_ready():
-    print(f"[ready] Logged in as {bot.user} ({bot.user.id})", flush=True)
-    # sync slash commands (so /health shows up)
     try:
-        synced = await bot.tree.sync()
-        print(f"[slash] synced {len(synced)} commands", flush=True)
+        if GUILD_ID: await bot.tree.sync(guild=discord.Object(id=GUILD_ID))
+        else:        await bot.tree.sync()
     except Exception as e:
-        print(f"[slash] sync failed: {e}", flush=True)
+        print("Slash sync error:", e)
+    print(f"Logged in as {bot.user}.")
 
-# ------------------- Tiny web server (Render port) -------------------
-async def _health_http(_req): return web.Response(text="ok")
-
-async def start_webserver():
-    app = web.Application()
-    app.router.add_get("/", _health_http)
-    app.router.add_get("/health", _health_http)
-    runner = web.AppRunner(app)
-    await runner.setup()
-    port = int(os.environ.get("PORT", "10000"))
-    site = web.TCPSite(runner, "0.0.0.0", port)
-    await site.start()
-    print(f"[keepalive] HTTP server listening on :{port}", flush=True)
-
-# ------------------- Boot both -------------------
-async def main():
-    try:
-        asyncio.create_task(start_webserver())
-        token = os.environ.get("DISCORD_TOKEN", "").strip()
-        if not token or len(token) < 50:
-            raise RuntimeError("Missing/short DISCORD_TOKEN.")
-        print("[boot] starting discord bot…", flush=True)
-        await bot.start(token)
-    except Exception as e:
-        print("[boot] FATAL:", e, flush=True)
-        traceback.print_exc()
-        raise
-
-if __name__ == "__main__":
-    asyncio.run(main())
+bot.run(TOKEN)
