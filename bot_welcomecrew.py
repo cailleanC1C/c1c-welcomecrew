@@ -412,7 +412,7 @@ def cmd_enabled(flag: bool):
         return wrapper
     return deco
 
-@bot.command(name="ping")
+# removed duplicate ping
 @cmd_enabled(ENABLE_CMD_PING)
 async def cmd_ping(ctx: commands.Context):
     await ctx.reply("🏓 Pong — Live and listening.", mention_author=False)
@@ -516,59 +516,3 @@ async def cmd_health(ctx: commands.Context):
         mention_author=False
     )
 
-@bot.command(name="ping")
-@cmd_enabled(ENABLE_CMD_PING)
-async def cmd_ping2(ctx: commands.Context):
-    await ctx.reply("🏓 Pong - Live and listening.", mention_author=False)
-
-@bot.command(name="checksheet")
-@cmd_enabled(ENABLE_CMD_CHECKSHEET)
-async def cmd_checksheet(ctx: commands.Context):
-    try:
-        ws1 = get_ws(SHEET1_NAME, HEADERS_SHEET1)
-        ws4 = get_ws(SHEET4_NAME, HEADERS_SHEET4)
-        rows1 = len(ws1.col_values(1))
-        rows4 = len(ws4.col_values(1))
-        await ctx.reply(
-            f"**{SHEET1_NAME}** rows (incl. header): {rows1}\n"
-            f"**{SHEET4_NAME}** rows (incl. header): {rows4}",
-            mention_author=False
-        )
-    except Exception as e:
-        await ctx.reply(f"checksheet failed: `{e}`", mention_author=False)
-
-@bot.command(name="reboot")
-@cmd_enabled(ENABLE_CMD_REBOOT)
-async def cmd_reboot(ctx: commands.Context):
-    await ctx.reply("Rebooting…", mention_author=False)
-    await asyncio.sleep(1.0)
-    os._exit(0)
-
-# ---------------- On ready + web health ----------------
-@bot.event
-async def on_ready():
-    print(f"Logged in as {bot.user}", flush=True)
-
-# optional aiohttp health server for Render
-if ENABLE_WEB_SERVER:
-    try:
-        from aiohttp import web
-        async def _health(request):
-            return web.Response(text="ok")
-        async def web_main():
-            app = web.Application()
-            app.router.add_get("/", _health); app.router.add_get("/health", _health)
-            port = int(os.getenv("PORT", "10000"))
-            runner = web.AppRunner(app); await runner.setup()
-            site = web.TCPSite(runner, "0.0.0.0", port); await site.start()
-            print(f"Health server on :{port}", flush=True)
-        async def start_all():
-            await asyncio.gather(web_main(), bot.start(TOKEN))
-        if __name__ == "__main__":
-            asyncio.run(start_all())
-    except Exception:
-        if __name__ == "__main__":
-            bot.run(TOKEN)
-else:
-    if __name__ == "__main__":
-        bot.run(TOKEN)
