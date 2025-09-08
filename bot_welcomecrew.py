@@ -1,7 +1,7 @@
-# C1C – WelcomeCrew (clean slate, v6 – accurate backfill + detailed reporting)
-# Prefix-only commands; sheet logging; strict ON/OFF flags.
+# C1C – WelcomeCrew (clean slate, v7)
+# Backfill + admin commands, strict ON/OFF flags, accurate upserts/dedupe, detailed reporting.
 #
-# Requires:
+# Requires (requirements.txt):
 #   discord.py
 #   gspread
 #   aiohttp
@@ -32,8 +32,12 @@
 #   ENABLE_CMD_CHECKSHEET
 #   ENABLE_CMD_REBOOT
 #   ENABLE_WEB_SERVER
+#
+# Dedupe/Upsert keys:
+#   Sheet1 (joiners) -> ticket
+#   Sheet4 (movers)  -> ticket + type + thread created
 
-import os, json, re, asyncio, time
+import os, json, re, asyncio, time, io
 from datetime import datetime, timezone as _tz
 from typing import Optional, Tuple, Dict, Any, List
 
@@ -93,18 +97,19 @@ def fmt_tz(dt: datetime) -> str:
     return (dt or datetime.utcnow().replace(tzinfo=_tz.utc)).strftime("%Y-%m-%d %H:%M")
 
 def _print_boot_info():
-    print("=== WelcomeCrew v6 boot ===", flush=True)
+    print("=== WelcomeCrew v7 boot ===", flush=True)
     print(f"Sheet tabs: {SHEET1_NAME} / {SHEET4_NAME}", flush=True)
     print(f"Welcome={WELCOME_CHANNEL_ID} Promo={PROMO_CHANNEL_ID}", flush=True)
+    print(f"TZ={TIMEZONE}", flush=True)
 
 # ---------- Sheets ----------
 _gs_client = None
 _ws_cache: Dict[str, Any] = {}          # name->worksheet
 _index_simple: Dict[str, Dict[str,int]] = {}  # for Sheet1: ticket -> row
-_index_promo:  Dict[str, Dict[str,int]] = {}  # for Sheet4: ticket||type -> row
+_index_promo:  Dict[str, Dict[str,int]] = {}  # for Sheet4: ticket||type||created -> row
 
 HEADERS_SHEET1 = ["ticket number","username","clantag","date closed"]
-HEADERS_SHEET4 = ["ticket number","username","clantag","date closed","type"]
+HEADERS_SHEET4 = ["ticket number","username","clantag","date closed","type","thread created"]
 
 def service_account_email() -> str:
     try:
@@ -122,6 +127,7 @@ def gs_client():
     return _gs_client
 
 def get_ws(name: str, want_headers: List[str]):
+    """Open worksheet; if header mismatches, overwrite header row in place."""
     if not GSHEET_ID: raise RuntimeError("GSHEET_ID not set")
     if name in _ws_cache: return _ws_cache[name]
     sh = gs_client().open_by_key(GSHEET_ID)
@@ -133,15 +139,17 @@ def get_ws(name: str, want_headers: List[str]):
     else:
         try:
             head = ws.row_values(1)
-            want_norm = [h.lower() for h in want_headers]
-            if [h.lower() for h in head][:len(want_norm)] != want_norm:
-                ws.insert_row(want_headers, 1)
-        except Exception: pass
+            head_norm = [h.strip().lower() for h in head]
+            want_norm = [h.strip().lower() for h in want_headers]
+            if head_norm != want_norm:
+                ws.update("A1", [want_headers])
+        except Exception:
+            pass
     _ws_cache[name] = ws
     return ws
 
-def _key_promo(ticket: str, typ: str) -> str:
-    return f"{(ticket or '').strip()}||{(typ or '').strip().lower()}"
+def _key_promo(ticket: str, typ: str, created: str) -> str:
+    return f"{(ticket or '').strip()}||{(typ or '').strip().lower()}||{(created or '').strip()}"
 
 def ws_index_welcome(name: str, ws) -> Dict[str,int]:
     idx = {}
@@ -160,16 +168,15 @@ def ws_index_promo(name: str, ws) -> Dict[str,int]:
         values = ws.get_all_values()
         if not values: return {}
         header = [h.strip().lower() for h in values[0]]
-        # find columns
-        col_ticket = 0
-        col_type = 4 if len(header) > 4 else None
-        if "ticket number" in header: col_ticket = header.index("ticket number")
-        if "type" in header: col_type = header.index("type")
+        col_ticket  = header.index("ticket number") if "ticket number" in header else 0
+        col_type    = header.index("type") if "type" in header else 4
+        col_created = header.index("thread created") if "thread created" in header else 5
         for r_i, row in enumerate(values[1:], start=2):
-            t = (row[col_ticket] if col_ticket < len(row) else "").strip().lstrip("#")
-            typ = (row[col_type] if (col_type is not None and col_type < len(row)) else "").strip().lower()
+            t   = (row[col_ticket]  if col_ticket  < len(row) else "").strip().lstrip("#")
+            typ = (row[col_type]    if col_type    < len(row) else "").strip().lower()
+            cr  = (row[col_created] if col_created < len(row) else "").strip()
             if t:
-                idx[_key_promo(t, typ)] = r_i
+                idx[_key_promo(t, typ, cr)] = r_i
     except Exception: pass
     _index_promo[name] = idx
     return idx
@@ -183,7 +190,6 @@ def upsert_welcome(name: str, ws, ticket: str, rowvals: List[str]) -> str:
             rng = f"A{row}:{chr(ord('A')+len(rowvals)-1)}{row}"
             ws.batch_update([{"range": rng, "values": [rowvals]}])
             return "updated"
-        # insert
         before = len(ws.col_values(1))
         ws.append_row(rowvals, value_input_option="USER_ENTERED")
         after = len(ws.col_values(1))
@@ -195,9 +201,9 @@ def upsert_welcome(name: str, ws, ticket: str, rowvals: List[str]) -> str:
         print("Welcome upsert error:", e, flush=True)
         return "error"
 
-def upsert_promo(name: str, ws, ticket: str, typ: str, rowvals: List[str]) -> str:
+def upsert_promo(name: str, ws, ticket: str, typ: str, created_str: str, rowvals: List[str]) -> str:
     ticket = (ticket or "").strip().lstrip("#")
-    key = _key_promo(ticket, typ)
+    key = _key_promo(ticket, typ, created_str)
     idx = _index_promo.get(name) or ws_index_promo(name, ws)
     try:
         if key in idx:
@@ -205,7 +211,6 @@ def upsert_promo(name: str, ws, ticket: str, typ: str, rowvals: List[str]) -> st
             rng = f"A{row}:{chr(ord('A')+len(rowvals)-1)}{row}"
             ws.batch_update([{"range": rng, "values": [rowvals]}])
             return "updated"
-        # insert
         before = len(ws.col_values(1))
         ws.append_row(rowvals, value_input_option="USER_ENTERED")
         after = len(ws.col_values(1))
@@ -218,28 +223,34 @@ def upsert_promo(name: str, ws, ticket: str, typ: str, rowvals: List[str]) -> st
         return "error"
 
 def dedupe_sheet(name: str, ws, has_type: bool=False) -> Tuple[int,int]:
-    """If has_type=True (Sheet4), dedupe by (ticket,type). Else by ticket only. Keep newest by date."""
+    """If has_type=True (Sheet4), dedupe by (ticket,type,created). Else by ticket only. Keep newest by date closed."""
     values = ws.get_all_values()
     if len(values) <= 1: return (0,0)
     rows = values[1:]
     header = [h.strip().lower() for h in values[0]]
-    col_ticket = 0
-    col_type   = 4 if has_type else None
-    col_date   = 3
-    if "ticket number" in header: col_ticket = header.index("ticket number")
-    if has_type and "type" in header: col_type = header.index("type")
-    if "date closed" in header: col_date = header.index("date closed")
+
+    col_ticket  = header.index("ticket number") if "ticket number" in header else 0
+    col_date    = header.index("date closed")   if "date closed"   in header else 3
+
+    if has_type:
+        col_type    = header.index("type")            if "type" in header else 4
+        col_created = header.index("thread created")  if "thread created" in header else 5
 
     winners: Dict[str, Tuple[int, Optional[datetime]]] = {}
     for i, row in enumerate(rows, start=2):
         t = (row[col_ticket] if col_ticket < len(row) else "").strip().lstrip("#")
-        typ = (row[col_type] if (has_type and col_type is not None and col_type < len(row)) else "").strip().lower()
-        key = _key_promo(t, typ) if has_type else t
-        if not key: continue
+        if not t: continue
+        if has_type:
+            typ = (row[col_type] if col_type < len(row) else "").strip().lower()
+            cr  = (row[col_created] if col_created < len(row) else "").strip()
+            key = _key_promo(t, typ, cr)
+        else:
+            key = t
         dt = None
         try:
             dt = datetime.strptime((row[col_date] if col_date < len(row) else "").strip(), "%Y-%m-%d %H:%M").replace(tzinfo=_tz.utc)
-        except Exception: pass
+        except Exception:
+            pass
         keep = winners.get(key)
         if not keep or ((dt or datetime.min.replace(tzinfo=_tz.utc)) > (keep[1] or datetime.min.replace(tzinfo=_tz.utc))):
             winners[key] = (i, dt)
@@ -251,7 +262,6 @@ def dedupe_sheet(name: str, ws, has_type: bool=False) -> Tuple[int,int]:
         try: ws.delete_rows(r); deleted += 1
         except Exception: pass
 
-    # rebuild indexes after mutations
     if has_type: ws_index_promo(name, ws)
     else: ws_index_welcome(name, ws)
     return (len(winners), deleted)
@@ -310,7 +320,7 @@ async def detect_promo_type(thread: discord.Thread) -> Optional[str]:
     except Exception: pass
     return None
 
-# ---------- Backfill state (now with ticket lists) ----------
+# ---------- Backfill state (with ticket lists) ----------
 def _new_bucket():
     return {"scanned":0,"added":0,"updated":0,"skipped":0,
             "added_ids":[], "updated_ids":[], "skipped_ids":[]}
@@ -331,13 +341,11 @@ async def scan_welcome_channel(channel: discord.TextChannel):
     ws = get_ws(SHEET1_NAME, HEADERS_SHEET1)
     ws_index_welcome(SHEET1_NAME, ws)
 
-    # public archived
     try:
         async for th in channel.archived_threads(limit=None, private=False):
             await _handle_welcome_thread(th, ws, st)
     except discord.Forbidden:
         backfill_state["last_msg"] = "no access to public archived welcome threads"
-    # private archived
     try:
         async for th in channel.archived_threads(limit=None, private=True):
             await _handle_welcome_thread(th, ws, st)
@@ -389,11 +397,13 @@ async def _handle_promo_thread(th: discord.Thread, ws, st):
         return
     ticket, username, clantag = parsed
     typ = await detect_promo_type(th) or ""
-    dt = await find_close_timestamp(th)
-    date_str = fmt_tz(dt or datetime.utcnow().replace(tzinfo=_tz.utc))
-    row = [ticket, username, clantag, date_str, typ]
-    status = upsert_promo(SHEET4_NAME, ws, ticket, typ, row)
-    key = f"{ticket}:{typ or 'unknown'}"
+    dt_close = await find_close_timestamp(th)
+    date_str = fmt_tz(dt_close or datetime.utcnow().replace(tzinfo=_tz.utc))
+    created_str = fmt_tz(th.created_at)
+
+    row = [ticket, username, clantag, date_str, typ, created_str]
+    status = upsert_promo(SHEET4_NAME, ws, ticket, typ, created_str, row)
+    key = f"{ticket}:{typ or 'unknown'}:{created_str}"
     if status == "inserted":
         st["added"] += 1; st["added_ids"].append(key)
     elif status == "updated":
@@ -455,7 +465,6 @@ async def cmd_backfill(ctx):
         f"Promo   — scanned: **{p['scanned']}**, added: **{p['added']}**, updated: **{p['updated']}**, skipped: **{p['skipped']}**\n"
         f"{backfill_state.get('last_msg','')}"
     )
-    # optional: dump a short report
     await _post_short_report(ctx)
 
 def _fmt_list(ids: List[str], max_items=10) -> str:
@@ -492,6 +501,16 @@ async def cmd_backfill_status(ctx):
         mention_author=False
     )
 
+@bot.command(name="backfill_report")
+async def cmd_backfill_report(ctx: commands.Context):
+    w = backfill_state["welcome"]; p = backfill_state["promo"]
+    lines = []
+    lines += ["WELCOME — added:", *w["added_ids"], "", "WELCOME — updated:", *w["updated_ids"], "", "WELCOME — skipped:", *w["skipped_ids"], ""]
+    lines += ["PROMO — added:",   *p["added_ids"], "", "PROMO — updated:",   *p["updated_ids"], "", "PROMO — skipped:",   *p["skipped_ids"], ""]
+    data = "\n".join(lines) or "(empty)"
+    buf = io.BytesIO(data.encode("utf-8"))
+    await ctx.reply(file=discord.File(buf, filename="backfill_report.txt"), mention_author=False)
+
 @bot.command(name="dedupe_sheet")
 @cmd_enabled(ENABLE_CMD_DEDUPE)
 async def cmd_dedupe(ctx):
@@ -499,10 +518,10 @@ async def cmd_dedupe(ctx):
         ws1 = get_ws(SHEET1_NAME, HEADERS_SHEET1)
         ws4 = get_ws(SHEET4_NAME, HEADERS_SHEET4)
         kept1, deleted1 = dedupe_sheet(SHEET1_NAME, ws1, has_type=False)
-        kept4, deleted4 = dedupe_sheet(SHEET4_NAME, ws4, has_type=True)  # NOTE: ticket+type
+        kept4, deleted4 = dedupe_sheet(SHEET4_NAME, ws4, has_type=True)  # NOTE: ticket+type+created
         await ctx.reply(
             f"Sheet1: kept **{kept1}** unique tickets, deleted **{deleted1}** dupes.\n"
-            f"Sheet4: kept **{kept4}** unique (ticket+type), deleted **{deleted4}** dupes.",
+            f"Sheet4: kept **{kept4}** unique (ticket+type+created), deleted **{deleted4}** dupes.",
             mention_author=False
         )
     except Exception as e:
