@@ -1,41 +1,6 @@
-# C1C – WelcomeCrew (clean slate, v7)
-# Backfill + admin commands, strict ON/OFF flags, accurate upserts/dedupe, detailed reporting.
-#
-# Requires (requirements.txt):
-#   discord.py
-#   gspread
-#   aiohttp
-#
-# Must-have env:
-#   DISCORD_TOKEN (or TOKEN)
-#   WELCOME_CHANNEL_ID
-#   PROMO_CHANNEL_ID
-#   GSHEET_ID
-#   GOOGLE_SERVICE_ACCOUNT_JSON
-#   TIMEZONE
-#
-# Optional:
-#   SHEET1_NAME=Sheet1
-#   SHEET4_NAME=Sheet4
-#   PORT=10000
-#
-# Feature flags (default ON; set OFF to disable):
-#   ENABLE_WELCOME_SCAN
-#   ENABLE_PROMO_SCAN
-#   ENABLE_CMD_SHEETSTATUS
-#   ENABLE_CMD_BACKFILL
-#   ENABLE_CMD_BACKFILL_STATUS
-#   ENABLE_CMD_DEDUPE
-#   ENABLE_CMD_RELOAD
-#   ENABLE_CMD_HEALTH
-#   ENABLE_CMD_PING
-#   ENABLE_CMD_CHECKSHEET
-#   ENABLE_CMD_REBOOT
-#   ENABLE_WEB_SERVER
-#
-# Dedupe/Upsert keys:
-#   Sheet1 (joiners) -> ticket
-#   Sheet4 (movers)  -> ticket + type + thread created
+# C1C – WelcomeCrew (v8)
+# Backfill + admin commands; strict ON/OFF; verified upserts; movers key = ticket+type+thread created;
+# detailed audit + on-demand debug tools.
 
 import os, json, re, asyncio, time, io
 from datetime import datetime, timezone as _tz
@@ -97,16 +62,16 @@ def fmt_tz(dt: datetime) -> str:
     return (dt or datetime.utcnow().replace(tzinfo=_tz.utc)).strftime("%Y-%m-%d %H:%M")
 
 def _print_boot_info():
-    print("=== WelcomeCrew v7 boot ===", flush=True)
+    print("=== WelcomeCrew v8 boot ===", flush=True)
     print(f"Sheet tabs: {SHEET1_NAME} / {SHEET4_NAME}", flush=True)
     print(f"Welcome={WELCOME_CHANNEL_ID} Promo={PROMO_CHANNEL_ID}", flush=True)
     print(f"TZ={TIMEZONE}", flush=True)
 
 # ---------- Sheets ----------
 _gs_client = None
-_ws_cache: Dict[str, Any] = {}          # name->worksheet
-_index_simple: Dict[str, Dict[str,int]] = {}  # for Sheet1: ticket -> row
-_index_promo:  Dict[str, Dict[str,int]] = {}  # for Sheet4: ticket||type||created -> row
+_ws_cache: Dict[str, Any] = {}
+_index_simple: Dict[str, Dict[str,int]] = {}  # Sheet1: ticket -> row
+_index_promo:  Dict[str, Dict[str,int]] = {}  # Sheet4: ticket||type||created -> row
 
 HEADERS_SHEET1 = ["ticket number","username","clantag","date closed"]
 HEADERS_SHEET4 = ["ticket number","username","clantag","date closed","type","thread created"]
@@ -134,7 +99,7 @@ def get_ws(name: str, want_headers: List[str]):
     try:
         ws = sh.worksheet(name)
     except gspread.WorksheetNotFound:
-        ws = sh.add_worksheet(title=name, rows=1000, cols=max(10,len(want_headers)))
+        ws = sh.add_worksheet(title=name, rows=2000, cols=max(10,len(want_headers)))
         ws.append_row(want_headers)
     else:
         try:
@@ -181,6 +146,23 @@ def ws_index_promo(name: str, ws) -> Dict[str,int]:
     _index_promo[name] = idx
     return idx
 
+# ---- VERIFIED upserts (no phantom adds) ----
+def _verify_find_exact(ws, value: str) -> Optional[int]:
+    """Return row of exact match anywhere on the sheet, else None."""
+    try:
+        cell = ws.find(f"^{re.escape(value)}$", in_column=1, regex=True)
+        if cell: return cell.row
+    except Exception:
+        try:
+            # fallback: scan last ~200 rows of col A
+            vals = ws.col_values(1)
+            for i in range(len(vals)-1, max(0, len(vals)-200), -1):
+                if vals[i].strip() == value:
+                    return i+1  # 1-indexed
+        except Exception:
+            pass
+    return None
+
 def upsert_welcome(name: str, ws, ticket: str, rowvals: List[str]) -> str:
     ticket = (ticket or "").strip().lstrip("#")
     idx = _index_simple.get(name) or ws_index_welcome(name, ws)
@@ -190,13 +172,14 @@ def upsert_welcome(name: str, ws, ticket: str, rowvals: List[str]) -> str:
             rng = f"A{row}:{chr(ord('A')+len(rowvals)-1)}{row}"
             ws.batch_update([{"range": rng, "values": [rowvals]}])
             return "updated"
-        before = len(ws.col_values(1))
         ws.append_row(rowvals, value_input_option="USER_ENTERED")
-        after = len(ws.col_values(1))
-        if after > before:
-            _index_simple.setdefault(name, {})[ticket] = after
+        # verify
+        found = _verify_find_exact(ws, ticket)
+        if found:
+            _index_simple.setdefault(name, {})[ticket] = found
             return "inserted"
-        return "error"
+        else:
+            return "error"
     except Exception as e:
         print("Welcome upsert error:", e, flush=True)
         return "error"
@@ -211,13 +194,15 @@ def upsert_promo(name: str, ws, ticket: str, typ: str, created_str: str, rowvals
             rng = f"A{row}:{chr(ord('A')+len(rowvals)-1)}{row}"
             ws.batch_update([{"range": rng, "values": [rowvals]}])
             return "updated"
-        before = len(ws.col_values(1))
         ws.append_row(rowvals, value_input_option="USER_ENTERED")
-        after = len(ws.col_values(1))
-        if after > before:
-            _index_promo.setdefault(name, {})[key] = after
+        # verify (look for exact ticket in col A AND match created/type near tail)
+        # cheap verify: ensure ticket exists somewhere; then rebuild index
+        found = _verify_find_exact(ws, ticket)
+        ws_index_promo(name, ws)  # rebuild to include new row
+        if found and (_key_promo(ticket, typ, created_str) in _index_promo[name]):
             return "inserted"
-        return "error"
+        else:
+            return "error"
     except Exception as e:
         print("Promo upsert error:", e, flush=True)
         return "error"
@@ -511,6 +496,42 @@ async def cmd_backfill_report(ctx: commands.Context):
     buf = io.BytesIO(data.encode("utf-8"))
     await ctx.reply(file=discord.File(buf, filename="backfill_report.txt"), mention_author=False)
 
+@bot.command(name="sheet_debug")
+async def cmd_sheet_debug(ctx: commands.Context):
+    try:
+        ws1 = get_ws(SHEET1_NAME, HEADERS_SHEET1)
+        ws4 = get_ws(SHEET4_NAME, HEADERS_SHEET4)
+        title = ws1.spreadsheet.title
+        last1 = ws1.get(f"A{max(2, ws1.row_count-5)}:D{ws1.row_count}")  # rough tail
+        last4 = ws4.get(f"A{max(2, ws4.row_count-5)}:F{ws4.row_count}")
+        def fmt_tail(rows):
+            rows = [r for r in rows if any(c for c in r)]
+            return "\n".join(" | ".join(r) for r in rows[-5:]) or "(no rows)"
+        await ctx.reply(
+            f"Spreadsheet: **{title}**\n"
+            f"Tab `{SHEET1_NAME}` tail:\n```\n{fmt_tail(last1)}\n```\n"
+            f"Tab `{SHEET4_NAME}` tail:\n```\n{fmt_tail(last4)}\n```",
+            mention_author=False
+        )
+    except Exception as e:
+        await ctx.reply(f"sheet_debug failed: `{e}`", mention_author=False)
+
+@bot.command(name="sheet_probe")
+async def cmd_sheet_probe(ctx: commands.Context):
+    """Append then delete a test row to prove write perms."""
+    try:
+        ws1 = get_ws(SHEET1_NAME, HEADERS_SHEET1)
+        token = f"TEST-{int(time.time())}"
+        row = [token,"probe","ZZZ",fmt_tz(datetime.utcnow().replace(tzinfo=_tz.utc))]
+        ws1.append_row(row, value_input_option="USER_ENTERED")
+        found = _verify_find_exact(ws1, token)
+        if not found:
+            return await ctx.reply("Probe append failed (not found).", mention_author=False)
+        ws1.delete_rows(found)
+        await ctx.reply("Probe write+delete succeeded.", mention_author=False)
+    except Exception as e:
+        await ctx.reply(f"sheet_probe failed: `{e}`", mention_author=False)
+
 @bot.command(name="dedupe_sheet")
 @cmd_enabled(ENABLE_CMD_DEDUPE)
 async def cmd_dedupe(ctx):
@@ -518,7 +539,7 @@ async def cmd_dedupe(ctx):
         ws1 = get_ws(SHEET1_NAME, HEADERS_SHEET1)
         ws4 = get_ws(SHEET4_NAME, HEADERS_SHEET4)
         kept1, deleted1 = dedupe_sheet(SHEET1_NAME, ws1, has_type=False)
-        kept4, deleted4 = dedupe_sheet(SHEET4_NAME, ws4, has_type=True)  # NOTE: ticket+type+created
+        kept4, deleted4 = dedupe_sheet(SHEET4_NAME, ws4, has_type=True)  # ticket+type+created
         await ctx.reply(
             f"Sheet1: kept **{kept1}** unique tickets, deleted **{deleted1}** dupes.\n"
             f"Sheet4: kept **{kept4}** unique (ticket+type+created), deleted **{deleted4}** dupes.",
