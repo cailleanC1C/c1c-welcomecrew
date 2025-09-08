@@ -1,6 +1,6 @@
-# C1C – WelcomeCrew (v10)
-# Backfill + admin commands; strict ON/OFF flags; clanlist-aware parsing; 4-digit tickets;
-# movers key = ticket+type+thread created; verified upserts; detailed audit + debug tools.
+# C1C – WelcomeCrew (v11)
+# Accurate backfill with live progress, clanlist-aware parsing (F-IT safe), 4-digit tickets,
+# movers key = ticket+type+thread created, verified upserts, detailed audit (updated diffs + all skipped).
 
 import os, json, re, asyncio, time, io
 from datetime import datetime, timezone as _tz
@@ -63,7 +63,7 @@ def fmt_tz(dt: datetime) -> str:
     return (dt or datetime.utcnow().replace(tzinfo=_tz.utc)).strftime("%Y-%m-%d %H:%M")
 
 def _print_boot_info():
-    print("=== WelcomeCrew v10 boot ===", flush=True)
+    print("=== WelcomeCrew v11 boot ===", flush=True)
     print(f"Sheets: {SHEET1_NAME} / {SHEET4_NAME} / clanlist:{CLANLIST_TAB_NAME}", flush=True)
     print(f"Welcome={WELCOME_CHANNEL_ID} Promo={PROMO_CHANNEL_ID}", flush=True)
     print(f"TZ={TIMEZONE}", flush=True)
@@ -100,7 +100,7 @@ def get_ws(name: str, want_headers: List[str]):
     try:
         ws = sh.worksheet(name)
     except gspread.WorksheetNotFound:
-        ws = sh.add_worksheet(title=name, rows=2000, cols=max(10,len(want_headers)))
+        ws = sh.add_worksheet(title=name, rows=4000, cols=max(10,len(want_headers)))
         ws.append_row(want_headers)
     else:
         try:
@@ -181,40 +181,77 @@ def ws_index_promo(name: str, ws) -> Dict[str,int]:
     _index_promo[name] = idx
     return idx
 
-# ---- VERIFIED upserts + promo fallback update ----
+# ---- helpers for diffs & verification ----
 def _verify_find_exact(ws, value: str) -> Optional[int]:
     """Return row of exact match in col A, else None."""
     try:
         cell = ws.find(f"^{re.escape(value)}$", in_column=1, regex=True)
         if cell: return cell.row
     except Exception:
-        try:
-            vals = ws.col_values(1)
-            for i in range(len(vals)-1, max(0, len(vals)-200), -1):
-                if vals[i].strip() == value:
-                    return i+1
-        except Exception:
-            pass
+        pass
+    try:
+        vals = ws.col_values(1)
+        for i in range(len(vals)-1, max(0, len(vals)-300), -1):
+            if (vals[i] or "").strip() == value:
+                return i+1
+    except Exception:
+        pass
     return None
 
-def upsert_welcome(name: str, ws, ticket: str, rowvals: List[str]) -> str:
+def _row_as_dict(header: List[str], row: List[str]) -> Dict[str,str]:
+    return { (header[i] if i < len(header) else f"col{i}").lower(): (row[i] if i < len(row) else "") for i in range(len(header)) }
+
+def _calc_diffs(header: List[str], before: List[str], after: List[str]) -> List[str]:
+    diffs = []
+    for i, col in enumerate(header):
+        old = (before[i] if i < len(before) else "").strip()
+        new = (after[i]  if i < len(after)  else "").strip()
+        if old != new:
+            diffs.append(f"{col}: '{old}' → '{new}'")
+    return diffs
+
+# ---------- Backfill state ----------
+def _new_bucket():
+    return {
+        "scanned":0,"added":0,"updated":0,"skipped":0,
+        "added_ids":[], "updated_ids":[], "skipped_ids":[],
+        "updated_details":[],                # ["0261: date closed '...' → '...'; clantag 'A' → 'B'"]
+        "skipped_reasons":{}                 # id -> reason
+    }
+
+backfill_state = {
+    "running": False,
+    "welcome": _new_bucket(),
+    "promo":   _new_bucket(),
+    "last_msg": ""
+}
+
+# ---- VERIFIED upserts + promo fallback update (with diffs) ----
+def upsert_welcome(name: str, ws, ticket: str, rowvals: List[str], st_bucket: dict) -> str:
     ticket = _fmt_ticket(ticket)
     idx = _index_simple.get(name) or ws_index_welcome(name, ws)
+    header = HEADERS_SHEET1
     try:
         if ticket in idx:
             row = idx[ticket]
+            before = ws.row_values(row)
             rng = f"A{row}:{chr(ord('A')+len(rowvals)-1)}{row}"
             ws.batch_update([{"range": rng, "values": [rowvals]}])
+            diffs = _calc_diffs(header, before, rowvals)
+            if diffs:
+                st_bucket["updated_details"].append(f"{ticket}: " + "; ".join(diffs))
             return "updated"
         # append as RAW so "0007" stays "0007"
+        before_len = len(ws.col_values(1))
         ws.append_row(rowvals, value_input_option="RAW")
-        found = _verify_find_exact(ws, ticket)
-        if found:
-            _index_simple.setdefault(name, {})[ticket] = found
+        after_len = len(ws.col_values(1))
+        if after_len > before_len or _verify_find_exact(ws, ticket):
+            _index_simple.setdefault(name, {})[ticket] = after_len
             return "inserted"
         else:
             return "error"
     except Exception as e:
+        st_bucket["skipped_reasons"][ticket] = f"upsert error: {e}"
         print("Welcome upsert error:", e, flush=True)
         return "error"
 
@@ -235,30 +272,42 @@ def _find_promo_row_pair(ws, ticket: str, typ: str) -> Optional[int]:
         pass
     return None
 
-def upsert_promo(name: str, ws, ticket: str, typ: str, created_str: str, rowvals: List[str]) -> str:
+def upsert_promo(name: str, ws, ticket: str, typ: str, created_str: str, rowvals: List[str], st_bucket: dict) -> str:
     ticket = _fmt_ticket(ticket)
     key = _key_promo(ticket, typ, created_str)
     idx = _index_promo.get(name) or ws_index_promo(name, ws)
+    header = HEADERS_SHEET4
     try:
         if key in idx:
             row = idx[key]
+            before = ws.row_values(row)
             rng = f"A{row}:{chr(ord('A')+len(rowvals)-1)}{row}"
             ws.batch_update([{"range": rng, "values": [rowvals]}])
+            diffs = _calc_diffs(header, before, rowvals)
+            if diffs:
+                st_bucket["updated_details"].append(f"{ticket}:{typ}:{created_str}: " + "; ".join(diffs))
             return "updated"
         # fallback: update old (ticket,type) row that lacks created
         rpair = _find_promo_row_pair(ws, ticket, typ)
         if rpair:
+            before = ws.row_values(rpair)
             rng = f"A{rpair}:{chr(ord('A')+len(rowvals)-1)}{rpair}"
             ws.batch_update([{"range": rng, "values": [rowvals]}])
             ws_index_promo(name, ws)
+            diffs = _calc_diffs(header, before, rowvals)
+            if diffs:
+                st_bucket["updated_details"].append(f"{ticket}:{typ}:{created_str}: " + "; ".join(diffs))
             return "updated"
         # else insert new (RAW to preserve 0000)
+        before_len = len(ws.col_values(1))
         ws.append_row(rowvals, value_input_option="RAW")
+        after_len = len(ws.col_values(1))
         ws_index_promo(name, ws)
-        if _key_promo(ticket, typ, created_str) in _index_promo[name]:
+        if after_len > before_len or (_key_promo(ticket, typ, created_str) in _index_promo[name]):
             return "inserted"
         return "error"
     except Exception as e:
+        st_bucket["skipped_reasons"][f"{ticket}:{typ}:{created_str}"] = f"upsert error: {e}"
         print("Promo upsert error:", e, flush=True)
         return "error"
 
@@ -329,7 +378,7 @@ async def find_close_timestamp(thread: discord.Thread) -> Optional[datetime]:
     try: await thread.join()
     except Exception: pass
     try:
-        async for msg in thread.history(limit=300, oldest_first=False):
+        async for msg in thread.history(limit=500, oldest_first=False):
             parts = [msg.content or ""]
             for e in msg.embeds or []:
                 parts += [e.title or "", e.description or ""]
@@ -371,20 +420,8 @@ def parse_promo_thread_name(name: str) -> Optional[Tuple[str,str,str]]:
         return (ticket, _clean_username(username), tag)
     return (ticket, _clean_username(remainder), "")
 
-# ---------- Backfill state ----------
-def _new_bucket():
-    return {"scanned":0,"added":0,"updated":0,"skipped":0,
-            "added_ids":[], "updated_ids":[], "skipped_ids":[]}
-
-backfill_state = {
-    "running": False,
-    "welcome": _new_bucket(),
-    "promo":   _new_bucket(),
-    "last_msg": ""
-}
-
-# ---------- Scans ----------
-async def scan_welcome_channel(channel: discord.TextChannel):
+# ---------- Scans (with live progress) ----------
+async def scan_welcome_channel(channel: discord.TextChannel, progress_cb=None):
     st = backfill_state["welcome"] = _new_bucket()
     if not ENABLE_WELCOME_SCAN:
         backfill_state["last_msg"] = "welcome scan disabled"; return
@@ -392,14 +429,25 @@ async def scan_welcome_channel(channel: discord.TextChannel):
     ws = get_ws(SHEET1_NAME, HEADERS_SHEET1)
     ws_index_welcome(SHEET1_NAME, ws)
 
+    async def handle(th: discord.Thread):
+        await _handle_welcome_thread(th, ws, st)
+        if progress_cb: await progress_cb()
+
+    # active (unarchived) threads
+    try:
+        for th in channel.threads:
+            await handle(th)
+    except Exception: pass
+
+    # archived: public + private
     try:
         async for th in channel.archived_threads(limit=None, private=False):
-            await _handle_welcome_thread(th, ws, st)
+            await handle(th)
     except discord.Forbidden:
-        backfill_state["last_msg"] = "no access to public archived welcome threads"
+        backfill_state["last_msg"] += " | no access to public archived welcome threads"
     try:
         async for th in channel.archived_threads(limit=None, private=True):
-            await _handle_welcome_thread(th, ws, st)
+            await handle(th)
     except discord.Forbidden:
         backfill_state["last_msg"] += " | no access to private archived welcome threads"
 
@@ -407,21 +455,22 @@ async def _handle_welcome_thread(th: discord.Thread, ws, st):
     st["scanned"] += 1
     parsed = parse_welcome_thread_name(th.name or "")
     if not parsed:
-        st["skipped"] += 1; st["skipped_ids"].append(f"name:{th.name}")
+        key = f"name:{th.name}"
+        st["skipped"] += 1; st["skipped_ids"].append(key); st["skipped_reasons"][key] = "name parse fail"
         return
     ticket, username, clantag = parsed
     dt = await find_close_timestamp(th)
     date_str = fmt_tz(dt or datetime.utcnow().replace(tzinfo=_tz.utc))
     row = [ticket, username, clantag, date_str]
-    status = upsert_welcome(SHEET1_NAME, ws, ticket, row)
+    status = upsert_welcome(SHEET1_NAME, ws, ticket, row, st)
     if status == "inserted":
         st["added"] += 1; st["added_ids"].append(ticket)
     elif status == "updated":
         st["updated"] += 1; st["updated_ids"].append(ticket)
     else:
-        st["skipped"] += 1; st["skipped_ids"].append(ticket)
+        st["skipped"] += 1; st["skipped_ids"].append(ticket); st["skipped_reasons"].setdefault(ticket, "unknown")
 
-async def scan_promo_channel(channel: discord.TextChannel):
+async def scan_promo_channel(channel: discord.TextChannel, progress_cb=None):
     st = backfill_state["promo"] = _new_bucket()
     if not ENABLE_PROMO_SCAN:
         backfill_state["last_msg"] = "promo scan disabled"; return
@@ -429,14 +478,23 @@ async def scan_promo_channel(channel: discord.TextChannel):
     ws = get_ws(SHEET4_NAME, HEADERS_SHEET4)
     ws_index_promo(SHEET4_NAME, ws)
 
+    async def handle(th: discord.Thread):
+        await _handle_promo_thread(th, ws, st)
+        if progress_cb: await progress_cb()
+
+    try:
+        for th in channel.threads:
+            await handle(th)
+    except Exception: pass
+
     try:
         async for th in channel.archived_threads(limit=None, private=False):
-            await _handle_promo_thread(th, ws, st)
+            await handle(th)
     except discord.Forbidden:
-        backfill_state["last_msg"] = "no access to public archived promo threads"
+        backfill_state["last_msg"] += " | no access to public archived promo threads"
     try:
         async for th in channel.archived_threads(limit=None, private=True):
-            await _handle_promo_thread(th, ws, st)
+            await handle(th)
     except discord.Forbidden:
         backfill_state["last_msg"] += " | no access to private archived promo threads"
 
@@ -444,7 +502,8 @@ async def _handle_promo_thread(th: discord.Thread, ws, st):
     st["scanned"] += 1
     parsed = parse_promo_thread_name(th.name or "")
     if not parsed:
-        st["skipped"] += 1; st["skipped_ids"].append(f"name:{th.name}")
+        key = f"name:{th.name}"
+        st["skipped"] += 1; st["skipped_ids"].append(key); st["skipped_reasons"][key] = "name parse fail"
         return
     ticket, username, clantag = parsed
     typ = await detect_promo_type(th) or ""
@@ -453,14 +512,14 @@ async def _handle_promo_thread(th: discord.Thread, ws, st):
     created_str = fmt_tz(th.created_at)
 
     row = [ticket, username, clantag, date_str, typ, created_str]
-    status = upsert_promo(SHEET4_NAME, ws, ticket, typ, created_str, row)
+    status = upsert_promo(SHEET4_NAME, ws, ticket, typ, created_str, row, st)
     key = f"{ticket}:{typ or 'unknown'}:{created_str}"
     if status == "inserted":
         st["added"] += 1; st["added_ids"].append(key)
     elif status == "updated":
         st["updated"] += 1; st["updated_ids"].append(key)
     else:
-        st["skipped"] += 1; st["skipped_ids"].append(key)
+        st["skipped"] += 1; st["skipped_ids"].append(key); st["skipped_reasons"].setdefault(key, "unknown")
 
 # ---------- Commands ----------
 def cmd_enabled(flag: bool):
@@ -491,31 +550,52 @@ async def cmd_sheetstatus(ctx):
     except Exception as e:
         await ctx.reply(f"⚠️ Cannot open sheet: `{e}`\nShare with: `{email}`", mention_author=False)
 
+def _render_status() -> str:
+    st = backfill_state; w = st["welcome"]; p = st["promo"]
+    return (
+        f"Running: **{st['running']}** | Last: {st.get('last_msg','')}\n"
+        f"Welcome — scanned: **{w['scanned']}**, added: **{w['added']}**, updated: **{w['updated']}**, skipped: **{w['skipped']}**\n"
+        f"Promo   — scanned: **{p['scanned']}**, added: **{p['added']}**, updated: **{p['updated']}**, skipped: **{p['skipped']}**"
+    )
+
 @bot.command(name="backfill_tickets")
 @cmd_enabled(ENABLE_CMD_BACKFILL)
 async def cmd_backfill(ctx):
     if backfill_state["running"]:
         return await ctx.reply("A backfill is already running. Use !backfill_status.", mention_author=False)
     backfill_state["running"] = True; backfill_state["last_msg"] = ""
-    await ctx.reply("Starting backfill… Use !backfill_status for progress.", mention_author=False)
+    progress_msg = await ctx.reply("Starting backfill…", mention_author=False)
+
+    # live updater
+    async def progress_loop():
+        while backfill_state["running"]:
+            try:
+                await progress_msg.edit(content=_render_status())
+            except Exception:
+                pass
+            await asyncio.sleep(5.0)
+    updater_task = asyncio.create_task(progress_loop())
+
     try:
+        # simple callback to ping the updater more often
+        async def tick(): 
+            try: await progress_msg.edit(content=_render_status())
+            except Exception: pass
+
         if ENABLE_WELCOME_SCAN and WELCOME_CHANNEL_ID:
             ch = bot.get_channel(WELCOME_CHANNEL_ID)
             if isinstance(ch, discord.TextChannel):
-                await scan_welcome_channel(ch)
+                await scan_welcome_channel(ch, progress_cb=tick)
         if ENABLE_PROMO_SCAN and PROMO_CHANNEL_ID:
             ch2 = bot.get_channel(PROMO_CHANNEL_ID)
             if isinstance(ch2, discord.TextChannel):
-                await scan_promo_channel(ch2)
+                await scan_promo_channel(ch2, progress_cb=tick)
     finally:
         backfill_state["running"] = False
-    w = backfill_state["welcome"]; p = backfill_state["promo"]
-    await ctx.send(
-        "Done.\n"
-        f"Welcome — scanned: **{w['scanned']}**, added: **{w['added']}**, updated: **{w['updated']}**, skipped: **{w['skipped']}**\n"
-        f"Promo   — scanned: **{p['scanned']}**, added: **{p['added']}**, updated: **{p['updated']}**, skipped: **{p['skipped']}**\n"
-        f"{backfill_state.get('last_msg','')}"
-    )
+        try: updater_task.cancel()
+        except Exception: pass
+
+    await progress_msg.edit(content=_render_status() + "\nDone.")
     await _post_short_report(ctx)
 
 def _fmt_list(ids: List[str], max_items=10) -> str:
@@ -539,27 +619,22 @@ async def _post_short_report(ctx):
 @bot.command(name="backfill_status")
 @cmd_enabled(ENABLE_CMD_BACKFILL_STATUS)
 async def cmd_backfill_status(ctx):
-    st = backfill_state; w = st["welcome"]; p = st["promo"]
-    await ctx.reply(
-        f"Running: **{st['running']}** | Last: {st.get('last_msg','')}\n"
-        f"Welcome — scanned: **{w['scanned']}**, added: **{w['added']}**, updated: **{w['updated']}**, skipped: **{w['skipped']}**\n"
-        f"Promo   — scanned: **{p['scanned']}**, added: **{p['added']}**, updated: **{p['updated']}**, skipped: **{p['skipped']}**\n"
-        f"Welcome added: {_fmt_list(w['added_ids'])}\n"
-        f"Welcome updated: {_fmt_list(w['updated_ids'])}\n"
-        f"Promo added: {_fmt_list(p['added_ids'])}\n"
-        f"Promo updated: {_fmt_list(p['updated_ids'])}",
-        mention_author=False
-    )
+    await ctx.reply(_render_status(), mention_author=False)
 
-@bot.command(name="backfill_report")
-async def cmd_backfill_report(ctx: commands.Context):
+@bot.command(name="backfill_details")
+async def cmd_backfill_details(ctx: commands.Context):
+    """Attachment with UPDATED diffs + ALL SKIPPED (ids + reason)."""
     w = backfill_state["welcome"]; p = backfill_state["promo"]
-    lines = []
-    lines += ["WELCOME — added:", *w["added_ids"], "", "WELCOME — updated:", *w["updated_ids"], "", "WELCOME — skipped:", *w["skipped_ids"], ""]
-    lines += ["PROMO — added:",   *p["added_ids"], "", "PROMO — updated:",   *p["updated_ids"], "", "PROMO — skipped:",   *p["skipped_ids"], ""]
+    def section(title, lines):
+        return [title] + (lines if lines else ["(none)"]) + [""]
+    lines: List[str] = []
+    lines += section("WELCOME — UPDATED (with diffs):", w["updated_details"])
+    lines += section("WELCOME — SKIPPED (id -> reason):", [f"{k} -> {v}" for k,v in w["skipped_reasons"].items()])
+    lines += section("PROMO — UPDATED (with diffs):", p["updated_details"])
+    lines += section("PROMO — SKIPPED (id -> reason):", [f"{k} -> {v}" for k,v in p["skipped_reasons"].items()])
     data = "\n".join(lines) or "(empty)"
     buf = io.BytesIO(data.encode("utf-8"))
-    await ctx.reply(file=discord.File(buf, filename="backfill_report.txt"), mention_author=False)
+    await ctx.reply(file=discord.File(buf, filename="backfill_details.txt"), mention_author=False)
 
 @bot.command(name="sheet_debug")
 async def cmd_sheet_debug(ctx: commands.Context):
@@ -580,22 +655,6 @@ async def cmd_sheet_debug(ctx: commands.Context):
         )
     except Exception as e:
         await ctx.reply(f"sheet_debug failed: `{e}`", mention_author=False)
-
-@bot.command(name="sheet_probe")
-async def cmd_sheet_probe(ctx: commands.Context):
-    """Append then delete a test row to prove write perms."""
-    try:
-        ws1 = get_ws(SHEET1_NAME, HEADERS_SHEET1)
-        token = f"{_fmt_ticket('9999')}-TEST-{int(time.time())}"
-        row = [token,"probe","ZZZ",fmt_tz(datetime.utcnow().replace(tzinfo=_tz.utc))]
-        ws1.append_row(row, value_input_option="RAW")
-        found = _verify_find_exact(ws1, token)
-        if not found:
-            return await ctx.reply("Probe append failed (not found).", mention_author=False)
-        ws1.delete_rows(found)
-        await ctx.reply("Probe write+delete succeeded.", mention_author=False)
-    except Exception as e:
-        await ctx.reply(f"sheet_probe failed: `{e}`", mention_author=False)
 
 @bot.command(name="dedupe_sheet")
 @cmd_enabled(ENABLE_CMD_DEDUPE)
