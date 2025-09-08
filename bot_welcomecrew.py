@@ -1,6 +1,6 @@
-# C1C – WelcomeCrew (v8)
-# Backfill + admin commands; strict ON/OFF; verified upserts; movers key = ticket+type+thread created;
-# detailed audit + on-demand debug tools.
+# C1C – WelcomeCrew (v10)
+# Backfill + admin commands; strict ON/OFF flags; clanlist-aware parsing; 4-digit tickets;
+# movers key = ticket+type+thread created; verified upserts; detailed audit + debug tools.
 
 import os, json, re, asyncio, time, io
 from datetime import datetime, timezone as _tz
@@ -15,11 +15,10 @@ try:
 except Exception:
     ZoneInfo = None
 
-# ---------- Flags ----------
+# ---------- Flags / Env ----------
 def env_bool(key: str, default: bool=True) -> bool:
     raw = (os.getenv(key) or "").strip().upper()
-    if raw == "":
-        return default
+    if raw == "": return default
     return raw == "ON"
 
 TOKEN = os.getenv("DISCORD_TOKEN") or os.getenv("TOKEN") or ""
@@ -29,6 +28,7 @@ GSHEET_ID          = os.getenv("GSHEET_ID", "")
 TIMEZONE           = os.getenv("TIMEZONE", "UTC")
 SHEET1_NAME        = os.getenv("SHEET1_NAME", "Sheet1")
 SHEET4_NAME        = os.getenv("SHEET4_NAME", "Sheet4")
+CLANLIST_TAB_NAME  = os.getenv("CLANLIST_TAB_NAME", "clanlist")
 
 ENABLE_WELCOME_SCAN        = env_bool("ENABLE_WELCOME_SCAN", True)
 ENABLE_PROMO_SCAN          = env_bool("ENABLE_PROMO_SCAN", True)
@@ -58,12 +58,13 @@ def fmt_tz(dt: datetime) -> str:
         if ZoneInfo:
             tz = ZoneInfo(TIMEZONE) if TIMEZONE else ZoneInfo("UTC")
             return dt.astimezone(tz).strftime("%Y-%m-%d %H:%M")
-    except Exception: pass
+    except Exception:
+        pass
     return (dt or datetime.utcnow().replace(tzinfo=_tz.utc)).strftime("%Y-%m-%d %H:%M")
 
 def _print_boot_info():
-    print("=== WelcomeCrew v8 boot ===", flush=True)
-    print(f"Sheet tabs: {SHEET1_NAME} / {SHEET4_NAME}", flush=True)
+    print("=== WelcomeCrew v10 boot ===", flush=True)
+    print(f"Sheets: {SHEET1_NAME} / {SHEET4_NAME} / clanlist:{CLANLIST_TAB_NAME}", flush=True)
     print(f"Welcome={WELCOME_CHANNEL_ID} Promo={PROMO_CHANNEL_ID}", flush=True)
     print(f"TZ={TIMEZONE}", flush=True)
 
@@ -113,15 +114,49 @@ def get_ws(name: str, want_headers: List[str]):
     _ws_cache[name] = ws
     return ws
 
+# ---- Clanlist cache ----
+_clan_tags_cache: List[str] = []
+_last_clan_fetch = 0.0
+
+def _load_clan_tags(force: bool=False) -> List[str]:
+    """Read clan tags from 'clanlist'. Uses 'clantag' column if present; else first column."""
+    global _clan_tags_cache, _last_clan_fetch
+    now = time.time()
+    if not force and _clan_tags_cache and (now - _last_clan_fetch < 300):
+        return _clan_tags_cache
+    tags: List[str] = []
+    try:
+        sh = gs_client().open_by_key(GSHEET_ID)
+        ws = sh.worksheet(CLANLIST_TAB_NAME)
+        values = ws.get_all_values()
+        if values:
+            header = [h.strip().lower() for h in values[0]]
+            col = header.index("clantag") if "clantag" in header else 0
+            for row in values[1:]:
+                if col < len(row):
+                    t = (row[col] or "").strip().upper()
+                    if t: tags.append(t)
+        _clan_tags_cache = list(dict.fromkeys(tags))
+        _last_clan_fetch = now
+    except Exception as e:
+        print("Failed to load clanlist:", e, flush=True)
+        _clan_tags_cache = []
+    return _clan_tags_cache
+
+# ---- Ticket formatting ----
+def _fmt_ticket(s: str) -> str:
+    """Normalize to 4 digits with leading zeros, strip any leading '#'. """
+    return (s or "").strip().lstrip("#").zfill(4)
+
 def _key_promo(ticket: str, typ: str, created: str) -> str:
-    return f"{(ticket or '').strip()}||{(typ or '').strip().lower()}||{(created or '').strip()}"
+    return f"{_fmt_ticket(ticket)}||{(typ or '').strip().lower()}||{(created or '').strip()}"
 
 def ws_index_welcome(name: str, ws) -> Dict[str,int]:
     idx = {}
     try:
         colA = ws.col_values(1)[1:]  # skip header
         for i, val in enumerate(colA, start=2):
-            t = (val or "").strip().lstrip("#")
+            t = _fmt_ticket(val)
             if t: idx[t] = i
     except Exception: pass
     _index_simple[name] = idx
@@ -137,7 +172,7 @@ def ws_index_promo(name: str, ws) -> Dict[str,int]:
         col_type    = header.index("type") if "type" in header else 4
         col_created = header.index("thread created") if "thread created" in header else 5
         for r_i, row in enumerate(values[1:], start=2):
-            t   = (row[col_ticket]  if col_ticket  < len(row) else "").strip().lstrip("#")
+            t   = _fmt_ticket(row[col_ticket]  if col_ticket  < len(row) else "")
             typ = (row[col_type]    if col_type    < len(row) else "").strip().lower()
             cr  = (row[col_created] if col_created < len(row) else "").strip()
             if t:
@@ -146,25 +181,24 @@ def ws_index_promo(name: str, ws) -> Dict[str,int]:
     _index_promo[name] = idx
     return idx
 
-# ---- VERIFIED upserts (no phantom adds) ----
+# ---- VERIFIED upserts + promo fallback update ----
 def _verify_find_exact(ws, value: str) -> Optional[int]:
-    """Return row of exact match anywhere on the sheet, else None."""
+    """Return row of exact match in col A, else None."""
     try:
         cell = ws.find(f"^{re.escape(value)}$", in_column=1, regex=True)
         if cell: return cell.row
     except Exception:
         try:
-            # fallback: scan last ~200 rows of col A
             vals = ws.col_values(1)
             for i in range(len(vals)-1, max(0, len(vals)-200), -1):
                 if vals[i].strip() == value:
-                    return i+1  # 1-indexed
+                    return i+1
         except Exception:
             pass
     return None
 
 def upsert_welcome(name: str, ws, ticket: str, rowvals: List[str]) -> str:
-    ticket = (ticket or "").strip().lstrip("#")
+    ticket = _fmt_ticket(ticket)
     idx = _index_simple.get(name) or ws_index_welcome(name, ws)
     try:
         if ticket in idx:
@@ -172,8 +206,8 @@ def upsert_welcome(name: str, ws, ticket: str, rowvals: List[str]) -> str:
             rng = f"A{row}:{chr(ord('A')+len(rowvals)-1)}{row}"
             ws.batch_update([{"range": rng, "values": [rowvals]}])
             return "updated"
-        ws.append_row(rowvals, value_input_option="USER_ENTERED")
-        # verify
+        # append as RAW so "0007" stays "0007"
+        ws.append_row(rowvals, value_input_option="RAW")
         found = _verify_find_exact(ws, ticket)
         if found:
             _index_simple.setdefault(name, {})[ticket] = found
@@ -184,8 +218,25 @@ def upsert_welcome(name: str, ws, ticket: str, rowvals: List[str]) -> str:
         print("Welcome upsert error:", e, flush=True)
         return "error"
 
+def _find_promo_row_pair(ws, ticket: str, typ: str) -> Optional[int]:
+    """Fallback: find row with same (ticket, type), ignoring 'thread created' (for legacy rows)."""
+    try:
+        values = ws.get_all_values()
+        if not values: return None
+        header = [h.strip().lower() for h in values[0]]
+        col_ticket  = header.index("ticket number") if "ticket number" in header else 0
+        col_type    = header.index("type") if "type" in header else 4
+        for r_i, row in enumerate(values[1:], start=2):
+            t   = _fmt_ticket(row[col_ticket] if col_ticket < len(row) else "")
+            ty2 = (row[col_type] if col_type < len(row) else "").strip().lower()
+            if t == _fmt_ticket(ticket) and ty2 == (typ or "").strip().lower():
+                return r_i
+    except Exception:
+        pass
+    return None
+
 def upsert_promo(name: str, ws, ticket: str, typ: str, created_str: str, rowvals: List[str]) -> str:
-    ticket = (ticket or "").strip().lstrip("#")
+    ticket = _fmt_ticket(ticket)
     key = _key_promo(ticket, typ, created_str)
     idx = _index_promo.get(name) or ws_index_promo(name, ws)
     try:
@@ -194,21 +245,25 @@ def upsert_promo(name: str, ws, ticket: str, typ: str, created_str: str, rowvals
             rng = f"A{row}:{chr(ord('A')+len(rowvals)-1)}{row}"
             ws.batch_update([{"range": rng, "values": [rowvals]}])
             return "updated"
-        ws.append_row(rowvals, value_input_option="USER_ENTERED")
-        # verify (look for exact ticket in col A AND match created/type near tail)
-        # cheap verify: ensure ticket exists somewhere; then rebuild index
-        found = _verify_find_exact(ws, ticket)
-        ws_index_promo(name, ws)  # rebuild to include new row
-        if found and (_key_promo(ticket, typ, created_str) in _index_promo[name]):
+        # fallback: update old (ticket,type) row that lacks created
+        rpair = _find_promo_row_pair(ws, ticket, typ)
+        if rpair:
+            rng = f"A{rpair}:{chr(ord('A')+len(rowvals)-1)}{rpair}"
+            ws.batch_update([{"range": rng, "values": [rowvals]}])
+            ws_index_promo(name, ws)
+            return "updated"
+        # else insert new (RAW to preserve 0000)
+        ws.append_row(rowvals, value_input_option="RAW")
+        ws_index_promo(name, ws)
+        if _key_promo(ticket, typ, created_str) in _index_promo[name]:
             return "inserted"
-        else:
-            return "error"
+        return "error"
     except Exception as e:
         print("Promo upsert error:", e, flush=True)
         return "error"
 
 def dedupe_sheet(name: str, ws, has_type: bool=False) -> Tuple[int,int]:
-    """If has_type=True (Sheet4), dedupe by (ticket,type,created). Else by ticket only. Keep newest by date closed."""
+    """If has_type=True (Sheet4), dedupe by (ticket,type,created). Else by ticket only; keep newest by date closed."""
     values = ws.get_all_values()
     if len(values) <= 1: return (0,0)
     rows = values[1:]
@@ -223,7 +278,7 @@ def dedupe_sheet(name: str, ws, has_type: bool=False) -> Tuple[int,int]:
 
     winners: Dict[str, Tuple[int, Optional[datetime]]] = {}
     for i, row in enumerate(rows, start=2):
-        t = (row[col_ticket] if col_ticket < len(row) else "").strip().lstrip("#")
+        t = _fmt_ticket(row[col_ticket] if col_ticket < len(row) else "")
         if not t: continue
         if has_type:
             typ = (row[col_type] if col_type < len(row) else "").strip().lower()
@@ -251,15 +306,24 @@ def dedupe_sheet(name: str, ws, has_type: bool=False) -> Tuple[int,int]:
     else: ws_index_welcome(name, ws)
     return (len(winners), deleted)
 
-# ---------- Parsing ----------
-WELCOME_PATTERN = re.compile(r'(?i)^closed-(\d{4})-([^-]+)-([A-Za-z0-9_]+)$')
-FALLBACK_NUM    = re.compile(r'(?i)(\d{4})')
+# ---------- Parsing (clanlist-aware) ----------
+WELCOME_START_RX = re.compile(r'(?i)^closed-(\d{4})-(.+)$')
+PROMO_START_RX   = re.compile(r'(?i)^.*?(\d{4})-(.+)$')
 
-PROMO_TYPE_PATTERNS = [
-    (re.compile(r"(?i)we['’]re excited to have you returning"), "returning player"),
-    (re.compile(r"(?i)thanks for sending in your move request"), "player move request"),
-    (re.compile(r"(?i)we['’]ve received your request to help one of your clan members find a new home"), "clan lead move request"),
-]
+def _clean_username(s: str) -> str:
+    s = (s or "").strip()
+    return re.sub(r'^[\s\-]+|[\s\-]+$', '', s)
+
+def _pick_tag_by_suffix(remainder: str, known_tags: List[str]) -> Optional[Tuple[str, str]]:
+    """Match '-TAG' where TAG is in known_tags (case-insensitive). Longest tag first."""
+    s = remainder.strip()
+    lower = s.lower()
+    for tag in sorted(known_tags, key=len, reverse=True):
+        t = tag.lower()
+        if lower.endswith("-" + t):
+            username = s[:-(len(tag) + 1)]
+            return (username.strip(), tag.upper())
+    return None
 
 async def find_close_timestamp(thread: discord.Thread) -> Optional[datetime]:
     try: await thread.join()
@@ -278,34 +342,36 @@ async def find_close_timestamp(thread: discord.Thread) -> Optional[datetime]:
     return None
 
 def parse_welcome_thread_name(name: str) -> Optional[Tuple[str,str,str]]:
-    m = WELCOME_PATTERN.match(name or "")
+    """Closed-0000-username-CLANTAG (CLANTAG must exist)."""
+    if not name: return None
+    m = WELCOME_START_RX.match(name.strip())
     if not m: return None
-    return (m.group(1), m.group(2).strip(), m.group(3).strip().upper())
-
-def parse_generic_ticket_user_tag(name: str) -> Optional[Tuple[str,str,str]]:
-    m = re.match(r'(?i).*(\d{4})-([^-]+)-([A-Za-z0-9_]+)$', name or "")
-    if m: return (m.group(1), m.group(2).strip(), m.group(3).strip().upper())
-    m2 = FALLBACK_NUM.search(name or ""); 
-    return (m2.group(1), "", "") if m2 else None
-
-async def detect_promo_type(thread: discord.Thread) -> Optional[str]:
-    try: await thread.join()
-    except Exception: pass
-    try:
-        async for msg in thread.history(limit=300, oldest_first=False):
-            parts = [msg.content or ""]
-            for e in msg.embeds or []:
-                parts += [e.title or "", e.description or ""]
-                if e.author and e.author.name: parts.append(e.author.name)
-                for f in e.fields or []: parts += [f.name or "", f.value or ""]
-            merged = " | ".join(parts)
-            for rx, typ in PROMO_TYPE_PATTERNS:
-                if rx.search(merged): return typ
-    except discord.Forbidden: pass
-    except Exception: pass
+    ticket = _fmt_ticket(m.group(1))
+    remainder = m.group(2)
+    picked = _pick_tag_by_suffix(remainder, _load_clan_tags())
+    if picked:
+        username, tag = picked
+        return (ticket, _clean_username(username), tag)
+    # fallback: last '-' split
+    if "-" in remainder:
+        u, t = remainder.rsplit("-", 1)
+        return (ticket, _clean_username(u), (t or "").strip().upper())
     return None
 
-# ---------- Backfill state (with ticket lists) ----------
+def parse_promo_thread_name(name: str) -> Optional[Tuple[str,str,str]]:
+    """Closed-0000-username[-CLANTAG] (tag optional)."""
+    if not name: return None
+    m = PROMO_START_RX.match(name.strip())
+    if not m: return None
+    ticket = _fmt_ticket(m.group(1))
+    remainder = m.group(2)
+    picked = _pick_tag_by_suffix(remainder, _load_clan_tags())
+    if picked:
+        username, tag = picked
+        return (ticket, _clean_username(username), tag)
+    return (ticket, _clean_username(remainder), "")
+
+# ---------- Backfill state ----------
 def _new_bucket():
     return {"scanned":0,"added":0,"updated":0,"skipped":0,
             "added_ids":[], "updated_ids":[], "skipped_ids":[]}
@@ -376,7 +442,7 @@ async def scan_promo_channel(channel: discord.TextChannel):
 
 async def _handle_promo_thread(th: discord.Thread, ws, st):
     st["scanned"] += 1
-    parsed = parse_generic_ticket_user_tag(th.name or "")
+    parsed = parse_promo_thread_name(th.name or "")
     if not parsed:
         st["skipped"] += 1; st["skipped_ids"].append(f"name:{th.name}")
         return
@@ -419,7 +485,7 @@ async def cmd_sheetstatus(ctx):
         ws4 = get_ws(SHEET4_NAME, HEADERS_SHEET4)
         title = ws1.spreadsheet.title
         await ctx.reply(
-            f"✅ Sheets OK: **{title}**\n• Tabs: `{SHEET1_NAME}`, `{SHEET4_NAME}`\n• Share with: `{email}`",
+            f"✅ Sheets OK: **{title}**\n• Tabs: `{SHEET1_NAME}`, `{SHEET4_NAME}`, `{CLANLIST_TAB_NAME}`\n• Share with: `{email}`",
             mention_author=False
         )
     except Exception as e:
@@ -454,8 +520,7 @@ async def cmd_backfill(ctx):
 
 def _fmt_list(ids: List[str], max_items=10) -> str:
     if not ids: return "—"
-    show = ids[:max_items]
-    extra = len(ids) - len(show)
+    show = ids[:max_items]; extra = len(ids) - len(show)
     return ", ".join(show) + (f" …(+{extra})" if extra>0 else "")
 
 async def _post_short_report(ctx):
@@ -502,7 +567,7 @@ async def cmd_sheet_debug(ctx: commands.Context):
         ws1 = get_ws(SHEET1_NAME, HEADERS_SHEET1)
         ws4 = get_ws(SHEET4_NAME, HEADERS_SHEET4)
         title = ws1.spreadsheet.title
-        last1 = ws1.get(f"A{max(2, ws1.row_count-5)}:D{ws1.row_count}")  # rough tail
+        last1 = ws1.get(f"A{max(2, ws1.row_count-5)}:D{ws1.row_count}")
         last4 = ws4.get(f"A{max(2, ws4.row_count-5)}:F{ws4.row_count}")
         def fmt_tail(rows):
             rows = [r for r in rows if any(c for c in r)]
@@ -521,9 +586,9 @@ async def cmd_sheet_probe(ctx: commands.Context):
     """Append then delete a test row to prove write perms."""
     try:
         ws1 = get_ws(SHEET1_NAME, HEADERS_SHEET1)
-        token = f"TEST-{int(time.time())}"
+        token = f"{_fmt_ticket('9999')}-TEST-{int(time.time())}"
         row = [token,"probe","ZZZ",fmt_tz(datetime.utcnow().replace(tzinfo=_tz.utc))]
-        ws1.append_row(row, value_input_option="USER_ENTERED")
+        ws1.append_row(row, value_input_option="RAW")
         found = _verify_find_exact(ws1, token)
         if not found:
             return await ctx.reply("Probe append failed (not found).", mention_author=False)
@@ -539,7 +604,7 @@ async def cmd_dedupe(ctx):
         ws1 = get_ws(SHEET1_NAME, HEADERS_SHEET1)
         ws4 = get_ws(SHEET4_NAME, HEADERS_SHEET4)
         kept1, deleted1 = dedupe_sheet(SHEET1_NAME, ws1, has_type=False)
-        kept4, deleted4 = dedupe_sheet(SHEET4_NAME, ws4, has_type=True)  # ticket+type+created
+        kept4, deleted4 = dedupe_sheet(SHEET4_NAME, ws4, has_type=True)
         await ctx.reply(
             f"Sheet1: kept **{kept1}** unique tickets, deleted **{deleted1}** dupes.\n"
             f"Sheet4: kept **{kept4}** unique (ticket+type+created), deleted **{deleted4}** dupes.",
@@ -552,7 +617,8 @@ async def cmd_dedupe(ctx):
 @cmd_enabled(ENABLE_CMD_RELOAD)
 async def cmd_reload(ctx):
     _ws_cache.clear(); _index_simple.clear(); _index_promo.clear()
-    global _gs_client; _gs_client = None
+    global _gs_client, _clan_tags_cache, _last_clan_fetch
+    _gs_client = None; _clan_tags_cache = []; _last_clan_fetch = 0.0
     await ctx.reply("Caches cleared. Reconnect to Sheets on next use.", mention_author=False)
 
 @bot.command(name="health")
