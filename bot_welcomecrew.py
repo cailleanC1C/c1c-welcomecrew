@@ -1,19 +1,23 @@
-# clean_welcomecrew_bot_v2.py
-# C1C – WelcomeCrew (clean slate, v2)
+# C1C – WelcomeCrew (clean slate, v4)
 # Prefix-only commands; sheet logging only; feature flags via env (strict ON/OFF).
 #
-# Requires:
-#   pip install discord.py gspread aiohttp
+# Requires (requirements.txt):
+#   discord.py
+#   gspread
+#   aiohttp
 #
-# Env vars:
+# Env vars (must have):
 #   DISCORD_TOKEN (or TOKEN)
-#   WELCOME_CHANNEL_ID              # integer
-#   PROMO_CHANNEL_ID                # integer (promotion-or-clan-move-requests)
+#   WELCOME_CHANNEL_ID              # forum channel id for #welcome
+#   PROMO_CHANNEL_ID                # forum channel id for #promotion-or-clan-move-requests
 #   GSHEET_ID
-#   GOOGLE_SERVICE_ACCOUNT_JSON     # full JSON blob
+#   GOOGLE_SERVICE_ACCOUNT_JSON     # full JSON blob (single line)
 #   TIMEZONE                        # e.g., Europe/Vienna
-#   SHEET1_NAME                     # default: Sheet1
-#   SHEET4_NAME                     # default: Sheet4
+#
+# Optional:
+#   SHEET1_NAME   (default: Sheet1)
+#   SHEET4_NAME   (default: Sheet4)
+#   PORT          (default: 10000)
 #
 # Feature flags (default ON; set to OFF to disable):
 #   ENABLE_WELCOME_SCAN
@@ -28,12 +32,7 @@
 #   ENABLE_CMD_CHECKSHEET
 #   ENABLE_CMD_REBOOT
 #   ENABLE_WEB_SERVER
-#
-# Permissions you need on the server:
-#   - View Channels, Read Message History
-#   - Manage Threads (to read archived private threads)
-#   - Send Messages, Embed Links
-#
+
 import os, json, re, asyncio, time
 from datetime import datetime, timezone as _tz
 from typing import Optional, Tuple, Dict, Any, List
@@ -49,7 +48,8 @@ except Exception:
     ZoneInfo = None
 
 # ---------------- Config & feature flags ----------------
-def env_bool(key: str, default: bool=True) -> bool:
+def env_bool(key: str, default: bool = True) -> bool:
+    """Strict ON/OFF flags. Unset => default, ON => True, anything else => False."""
     raw = (os.getenv(key) or "").strip().upper()
     if raw == "":
         return default
@@ -83,18 +83,6 @@ bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
 
 START_TS = time.time()
 
-def _print_boot_info():
-    print("=== WelcomeCrew v3 boot ===", flush=True)
-    print(f"ENABLE_WEB_SERVER={ENABLE_WEB_SERVER}", flush=True)
-    print(f"WELCOME_CHANNEL_ID={WELCOME_CHANNEL_ID}", flush=True)
-    print(f"PROMO_CHANNEL_ID={PROMO_CHANNEL_ID}", flush=True)
-    print(f"SHEET1_NAME={SHEET1_NAME} | SHEET4_NAME={SHEET4_NAME}", flush=True)
-    tz = TIMEZONE or "UTC"
-    print(f"TIMEZONE={tz}", flush=True)
-    tok_ok = bool(TOKEN) and len(TOKEN) >= 50
-    print(f"TOKEN_SET={'yes' if TOKEN else 'no'} | TOKEN_LIKELY_VALID={'yes' if tok_ok else 'no'}", flush=True)
-
-
 def uptime_str() -> str:
     secs = int(time.time() - START_TS)
     h, r = divmod(secs, 3600)
@@ -113,6 +101,17 @@ def fmt_tz(dt: datetime) -> str:
     except Exception:
         return datetime.utcnow().strftime("%Y-%m-%d %H:%M")
 
+def _print_boot_info():
+    print("=== WelcomeCrew v4 boot ===", flush=True)
+    print(f"ENABLE_WEB_SERVER={ENABLE_WEB_SERVER}", flush=True)
+    print(f"WELCOME_CHANNEL_ID={WELCOME_CHANNEL_ID}", flush=True)
+    print(f"PROMO_CHANNEL_ID={PROMO_CHANNEL_ID}", flush=True)
+    print(f"SHEET1_NAME={SHEET1_NAME} | SHEET4_NAME={SHEET4_NAME}", flush=True)
+    tz = TIMEZONE or "UTC"
+    print(f"TIMEZONE={tz}", flush=True)
+    tok_ok = bool(TOKEN) and len(TOKEN) >= 50
+    print(f"TOKEN_SET={'yes' if TOKEN else 'no'} | TOKEN_LIKELY_VALID={'yes' if tok_ok else 'no'}", flush=True)
+
 # ---------------- Google Sheets ----------------
 _gs_client = None
 _ws_cache: Dict[str, Any] = {}      # name -> worksheet
@@ -122,7 +121,7 @@ def service_account_email() -> str:
     try:
         raw = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON") or ""
         data = json.loads(raw)
-        return data.get("client_email","")
+        return data.get("client_email", "")
     except Exception:
         return ""
 
@@ -178,11 +177,11 @@ def parse_dt(s: str) -> Optional[datetime]:
 def normalize_ticket(t: str) -> str:
     return (t or "").strip().lstrip("#")
 
-def ws_index(name: str, ws) -> Dict[str,int]:
+def ws_index(name: str, ws) -> Dict[str, int]:
     """Build or return cached ticket->row map (column A)."""
     if _index_cache.get(name):
         return _index_cache[name]
-    idx: Dict[str,int] = {}
+    idx: Dict[str, int] = {}
     try:
         colA = ws.col_values(1)[1:]  # skip header
         for i, val in enumerate(colA, start=2):
@@ -201,7 +200,7 @@ def upsert_row(name: str, ws, ticket: str, rowvals: List[str]) -> str:
     try:
         if ticket in idx:
             row = idx[ticket]
-            rng = f"A{row}:{chr(ord('A')+len(rowvals)-1)}{row}"
+            rng = f"A{row}:{chr(ord('A') + len(rowvals) - 1)}{row}"
             ws.batch_update([{"range": rng, "values": [rowvals]}])
             return "updated"
         else:
@@ -217,29 +216,24 @@ def upsert_row(name: str, ws, ticket: str, rowvals: List[str]) -> str:
         print("Upsert error:", e, flush=True)
         return "error"
 
-def dedupe_sheet(name: str, ws, has_type: bool=False) -> Tuple[int,int]:
+def dedupe_sheet(name: str, ws, has_type: bool = False) -> Tuple[int, int]:
     """Remove duplicate tickets; keep newest by date (col D)."""
     values = ws.get_all_values()
     if len(values) <= 1:
-        return (0,0)
-    header = values[0]
+        return (0, 0)
     rows = values[1:]
     winners: Dict[str, Tuple[int, Optional[datetime]]] = {}
     for i, row in enumerate(rows, start=2):
-        ticket = normalize_ticket(row[0] if len(row)>0 else "")
+        ticket = normalize_ticket(row[0] if len(row) > 0 else "")
         if not ticket:
             continue
-        dt = parse_dt(row[3] if len(row)>3 else "")
+        dt = parse_dt(row[3] if len(row) > 3 else "")
         keep = winners.get(ticket)
         if not keep or ((dt or datetime.min.replace(tzinfo=_tz.utc)) > (keep[1] or datetime.min.replace(tzinfo=_tz.utc))):
             winners[ticket] = (i, dt)
-    # delete everything not a winner
-    to_delete = []
+    # delete everything not a winner (bottom-up)
     keep_rows = {row for (row, _dt) in winners.values()}
-    for i, _ in enumerate(rows, start=2):
-        if i not in keep_rows:
-            to_delete.append(i)
-    # delete from bottom to top
+    to_delete = [i for i, _ in enumerate(rows, start=2) if i not in keep_rows]
     deleted = 0
     for r in sorted(to_delete, reverse=True):
         try:
@@ -253,8 +247,9 @@ def dedupe_sheet(name: str, ws, has_type: bool=False) -> Tuple[int,int]:
     return (len(winners), deleted)
 
 # ---------------- Thread parsing helpers ----------------
+# Welcome thread pattern: Closed-0000-username-CLANTAG (exactly 4 digits)
 WELCOME_PATTERN = re.compile(r'(?i)^closed-(\d{4})-([^-]+)-([A-Za-z0-9_]+)$')
-FALLBACK_NUM = re.compile(r'(?i)(\d{4})')
+FALLBACK_NUM    = re.compile(r'(?i)(\d{4})')  # generic 4-digit extractor
 
 PROMO_TYPE_PATTERNS = [
     (re.compile(r"(?i)we['’]re excited to have you returning"), "returning player"),
@@ -275,9 +270,11 @@ async def find_close_timestamp(thread: discord.Thread) -> Optional[datetime]:
             for e in msg.embeds or []:
                 parts.append(e.title or "")
                 parts.append(e.description or "")
-                if e.author and e.author.name: parts.append(e.author.name)
+                if e.author and e.author.name:
+                    parts.append(e.author.name)
                 for f in e.fields or []:
-                    parts.append(f.name or ""); parts.append(f.value or "")
+                    parts.append(f.name or "")
+                    parts.append(f.value or "")
             merged = " | ".join(parts).lower()
             if "ticket closed by" in merged:
                 return msg.created_at
@@ -287,18 +284,18 @@ async def find_close_timestamp(thread: discord.Thread) -> Optional[datetime]:
         pass
     return None
 
-def parse_welcome_thread_name(name: str) -> Optional[Tuple[str,str,str]]:
+def parse_welcome_thread_name(name: str) -> Optional[Tuple[str, str, str]]:
     """Return (ticket, username, clantag) or None."""
     m = WELCOME_PATTERN.match(name or "")
-    if not m: return None
+    if not m:
+        return None
     return (m.group(1), m.group(2).strip(), m.group(3).strip().upper())
 
-def parse_generic_ticket_user_tag(name: str) -> Optional[Tuple[str,str,str]]:
-    """Fallback: find 4digits-username-tag at end."""
+def parse_generic_ticket_user_tag(name: str) -> Optional[Tuple[str, str, str]]:
+    """Fallback: find 4digits-username-tag at end, else just the 4-digit ticket id."""
     m = re.match(r'(?i).*(\d{4})-([^-]+)-([A-Za-z0-9_]+)$', name or "")
     if m:
         return (m.group(1), m.group(2).strip(), m.group(3).strip().upper())
-    # any 4-digit group at least?
     m2 = FALLBACK_NUM.search(name or "")
     if m2:
         return (m2.group(1), "", "")
@@ -314,10 +311,13 @@ async def detect_promo_type(thread: discord.Thread) -> Optional[str]:
         async for msg in thread.history(limit=300, oldest_first=False):
             parts = [msg.content or ""]
             for e in msg.embeds or []:
-                parts.append(e.title or ""); parts.append(e.description or "")
-                if e.author and e.author.name: parts.append(e.author.name)
+                parts.append(e.title or "")
+                parts.append(e.description or "")
+                if e.author and e.author.name:
+                    parts.append(e.author.name)
                 for f in e.fields or []:
-                    parts.append(f.name or ""); parts.append(f.value or "")
+                    parts.append(f.name or "")
+                    parts.append(f.value or "")
             merged = " | ".join(parts)
             for rx, typ in PROMO_TYPE_PATTERNS:
                 if rx.search(merged):
@@ -331,37 +331,37 @@ async def detect_promo_type(thread: discord.Thread) -> Optional[str]:
 # ---------------- Backfill engine ----------------
 backfill_state = {
     "running": False,
-    "welcome": {"scanned":0, "added":0, "updated":0, "skipped":0},
-    "promo":   {"scanned":0, "added":0, "updated":0, "skipped":0},
+    "welcome": {"scanned": 0, "added": 0, "updated": 0, "skipped": 0},
+    "promo":   {"scanned": 0, "added": 0, "updated": 0, "skipped": 0},
     "last_msg": ""
 }
 
-HEADERS_SHEET1 = ["ticket number","username","clantag","date closed"]
-HEADERS_SHEET4 = ["ticket number","username","clantag","date closed","type"]
+HEADERS_SHEET1 = ["ticket number", "username", "clantag", "date closed"]
+HEADERS_SHEET4 = ["ticket number", "username", "clantag", "date closed", "type"]
 
-async def scan_welcome_channel(channel: discord.TextChannel):
-    st = backfill_state["welcome"] = {"scanned":0, "added":0, "updated":0, "skipped":0}
-    if not ENABLE_WELCOME_SCAN: 
+async def scan_welcome_channel(channel) -> None:
+    st = backfill_state["welcome"] = {"scanned": 0, "added": 0, "updated": 0, "skipped": 0}
+    if not ENABLE_WELCOME_SCAN:
         backfill_state["last_msg"] = "welcome scan disabled"
         return
 
     ws = get_ws(SHEET1_NAME, HEADERS_SHEET1)
-    idx = ws_index(SHEET1_NAME, ws)
+    ws_index(SHEET1_NAME, ws)  # warm index
 
     # public archived
     try:
         async for th in channel.archived_threads(limit=None, private=False):
-            await _handle_welcome_thread(th, ws, idx, st)
+            await _handle_welcome_thread(th, ws, st)
     except discord.Forbidden:
         backfill_state["last_msg"] = "no access to public archived welcome threads"
     # private archived
     try:
         async for th in channel.archived_threads(limit=None, private=True):
-            await _handle_welcome_thread(th, ws, idx, st)
+            await _handle_welcome_thread(th, ws, st)
     except discord.Forbidden:
         backfill_state["last_msg"] += " | no access to private archived welcome threads"
 
-async def _handle_welcome_thread(th: discord.Thread, ws, idx_map, st):
+async def _handle_welcome_thread(th: discord.Thread, ws, st: Dict[str, int]):
     st["scanned"] += 1
     parsed = parse_welcome_thread_name(th.name or "")
     if not parsed:
@@ -372,33 +372,36 @@ async def _handle_welcome_thread(th: discord.Thread, ws, idx_map, st):
     date_str = fmt_tz(dt or datetime.utcnow().replace(tzinfo=_tz.utc))
     row = [ticket, username, clantag, date_str]
     status = upsert_row(SHEET1_NAME, ws, ticket, row)
-    if status == "inserted": st["added"] += 1
-    elif status == "updated": st["updated"] += 1
-    else: st["skipped"] += 1
+    if status == "inserted":
+        st["added"] += 1
+    elif status == "updated":
+        st["updated"] += 1
+    else:
+        st["skipped"] += 1
 
-async def scan_promo_channel(channel: discord.TextChannel):
-    st = backfill_state["promo"] = {"scanned":0, "added":0, "updated":0, "skipped":0}
+async def scan_promo_channel(channel) -> None:
+    st = backfill_state["promo"] = {"scanned": 0, "added": 0, "updated": 0, "skipped": 0}
     if not ENABLE_PROMO_SCAN:
         backfill_state["last_msg"] = "promo scan disabled"
         return
 
     ws = get_ws(SHEET4_NAME, HEADERS_SHEET4)
-    idx = ws_index(SHEET4_NAME, ws)
+    ws_index(SHEET4_NAME, ws)  # warm index
 
     # public archived
     try:
         async for th in channel.archived_threads(limit=None, private=False):
-            await _handle_promo_thread(th, ws, idx, st)
+            await _handle_promo_thread(th, ws, st)
     except discord.Forbidden:
         backfill_state["last_msg"] = "no access to public archived promo threads"
     # private archived
     try:
         async for th in channel.archived_threads(limit=None, private=True):
-            await _handle_promo_thread(th, ws, idx, st)
+            await _handle_promo_thread(th, ws, st)
     except discord.Forbidden:
         backfill_state["last_msg"] += " | no access to private archived promo threads"
 
-async def _handle_promo_thread(th: discord.Thread, ws, idx_map, st):
+async def _handle_promo_thread(th: discord.Thread, ws, st: Dict[str, int]):
     st["scanned"] += 1
     parsed = parse_generic_ticket_user_tag(th.name or "")
     if not parsed:
@@ -410,9 +413,12 @@ async def _handle_promo_thread(th: discord.Thread, ws, idx_map, st):
     date_str = fmt_tz(dt or datetime.utcnow().replace(tzinfo=_tz.utc))
     row = [ticket, username, clantag, date_str, typ]
     status = upsert_row(SHEET4_NAME, ws, ticket, row)
-    if status == "inserted": st["added"] += 1
-    elif status == "updated": st["updated"] += 1
-    else: st["skipped"] += 1
+    if status == "inserted":
+        st["added"] += 1
+    elif status == "updated":
+        st["updated"] += 1
+    else:
+        st["skipped"] += 1
 
 # ---------------- Commands (prefix only) ----------------
 def cmd_enabled(flag: bool):
@@ -424,7 +430,7 @@ def cmd_enabled(flag: bool):
         return wrapper
     return deco
 
-# removed duplicate ping
+@bot.command(name="ping")
 @cmd_enabled(ENABLE_CMD_PING)
 async def cmd_ping(ctx: commands.Context):
     await ctx.reply("🏓 Pong — Live and listening.", mention_author=False)
@@ -459,11 +465,11 @@ async def cmd_backfill(ctx: commands.Context):
     try:
         if ENABLE_WELCOME_SCAN and WELCOME_CHANNEL_ID:
             ch = bot.get_channel(WELCOME_CHANNEL_ID)
-            if isinstance(ch, discord.TextChannel):
+            if ch and hasattr(ch, "archived_threads"):
                 await scan_welcome_channel(ch)
         if ENABLE_PROMO_SCAN and PROMO_CHANNEL_ID:
             ch2 = bot.get_channel(PROMO_CHANNEL_ID)
-            if isinstance(ch2, discord.TextChannel):
+            if ch2 and hasattr(ch2, "archived_threads"):
                 await scan_promo_channel(ch2)
     finally:
         backfill_state["running"] = False
@@ -528,3 +534,82 @@ async def cmd_health(ctx: commands.Context):
         mention_author=False
     )
 
+@bot.command(name="checksheet")
+@cmd_enabled(ENABLE_CMD_CHECKSHEET)
+async def cmd_checksheet(ctx: commands.Context):
+    try:
+        ws1 = get_ws(SHEET1_NAME, HEADERS_SHEET1)
+        ws4 = get_ws(SHEET4_NAME, HEADERS_SHEET4)
+        rows1 = len(ws1.col_values(1))
+        rows4 = len(ws4.col_values(1))
+        await ctx.reply(
+            f"**{SHEET1_NAME}** rows (incl. header): {rows1}\n"
+            f"**{SHEET4_NAME}** rows (incl. header): {rows4}",
+            mention_author=False
+        )
+    except Exception as e:
+        await ctx.reply(f"checksheet failed: `{e}`", mention_author=False)
+
+@bot.command(name="reboot")
+@cmd_enabled(ENABLE_CMD_REBOOT)
+async def cmd_reboot(ctx: commands.Context):
+    await ctx.reply("Rebooting…", mention_author=False)
+    await asyncio.sleep(1.0)
+    os._exit(0)
+
+# ---------------- On ready + web health ----------------
+@bot.event
+async def on_ready():
+    print(f"Logged in as {bot.user}", flush=True)
+
+if ENABLE_WEB_SERVER:
+    try:
+        from aiohttp import web
+
+        async def _health(request):
+            return web.Response(text="ok")
+
+        async def web_main():
+            app = web.Application()
+            app.router.add_get("/", _health)
+            app.router.add_get("/health", _health)
+            port = int(os.getenv("PORT", "10000"))
+            runner = web.AppRunner(app)
+            await runner.setup()
+            site = web.TCPSite(runner, "0.0.0.0", port)
+            await site.start()
+            print(f"Health server on :{port}", flush=True)
+
+        async def start_all():
+            _print_boot_info()
+
+            async def run_bot():
+                if not TOKEN:
+                    print("FATAL: DISCORD_TOKEN/TOKEN is not set. Exiting.", flush=True)
+                    raise SystemExit(2)
+                try:
+                    await bot.start(TOKEN)
+                except Exception as e:
+                    import traceback
+                    print("Bot failed to start:", repr(e), flush=True)
+                    traceback.print_exc()
+                    raise
+
+            await asyncio.gather(web_main(), run_bot())
+
+        if __name__ == "__main__":
+            asyncio.run(start_all())
+    except Exception:
+        if __name__ == "__main__":
+            _print_boot_info()
+            if not TOKEN:
+                print("FATAL: DISCORD_TOKEN/TOKEN is not set. Exiting.", flush=True)
+            else:
+                bot.run(TOKEN)
+else:
+    if __name__ == "__main__":
+        _print_boot_info()
+        if not TOKEN:
+            print("FATAL: DISCORD_TOKEN/TOKEN is not set. Exiting.", flush=True)
+        else:
+            bot.run(TOKEN)
