@@ -1,6 +1,7 @@
-# C1C – WelcomeCrew (v11)
-# Accurate backfill with live progress, clanlist-aware parsing (F-IT safe), 4-digit tickets,
-# movers key = ticket+type+thread created, verified upserts, detailed audit (updated diffs + all skipped).
+# C1C – WelcomeCrew (v12)
+# Adds: infer clan tag from latest thread message for Welcome (title may lack tag).
+# Keeps: live progress, detailed diffs, clanlist-aware parsing (F-IT safe), 4-digit tickets,
+# movers key = ticket+type+thread created, verified upserts.
 
 import os, json, re, asyncio, time, io
 from datetime import datetime, timezone as _tz
@@ -29,6 +30,9 @@ TIMEZONE           = os.getenv("TIMEZONE", "UTC")
 SHEET1_NAME        = os.getenv("SHEET1_NAME", "Sheet1")
 SHEET4_NAME        = os.getenv("SHEET4_NAME", "Sheet4")
 CLANLIST_TAB_NAME  = os.getenv("CLANLIST_TAB_NAME", "clanlist")
+
+# Toggle: try to infer tag from thread when welcome title lacks it (ON/OFF)
+ENABLE_INFER_TAG_FROM_THREAD = env_bool("ENABLE_INFER_TAG_FROM_THREAD", True)
 
 ENABLE_WELCOME_SCAN        = env_bool("ENABLE_WELCOME_SCAN", True)
 ENABLE_PROMO_SCAN          = env_bool("ENABLE_PROMO_SCAN", True)
@@ -63,10 +67,10 @@ def fmt_tz(dt: datetime) -> str:
     return (dt or datetime.utcnow().replace(tzinfo=_tz.utc)).strftime("%Y-%m-%d %H:%M")
 
 def _print_boot_info():
-    print("=== WelcomeCrew v11 boot ===", flush=True)
+    print("=== WelcomeCrew v12 boot ===", flush=True)
     print(f"Sheets: {SHEET1_NAME} / {SHEET4_NAME} / clanlist:{CLANLIST_TAB_NAME}", flush=True)
     print(f"Welcome={WELCOME_CHANNEL_ID} Promo={PROMO_CHANNEL_ID}", flush=True)
-    print(f"TZ={TIMEZONE}", flush=True)
+    print(f"TZ={TIMEZONE} | infer-from-thread={ENABLE_INFER_TAG_FROM_THREAD}", flush=True)
 
 # ---------- Sheets ----------
 _gs_client = None
@@ -93,7 +97,6 @@ def gs_client():
     return _gs_client
 
 def get_ws(name: str, want_headers: List[str]):
-    """Open worksheet; if header mismatches, overwrite header row in place."""
     if not GSHEET_ID: raise RuntimeError("GSHEET_ID not set")
     if name in _ws_cache: return _ws_cache[name]
     sh = gs_client().open_by_key(GSHEET_ID)
@@ -105,22 +108,29 @@ def get_ws(name: str, want_headers: List[str]):
     else:
         try:
             head = ws.row_values(1)
-            head_norm = [h.strip().lower() for h in head]
-            want_norm = [h.strip().lower() for h in want_headers]
-            if head_norm != want_norm:
+            if [h.strip().lower() for h in head] != [h.strip().lower() for h in want_headers]:
                 ws.update("A1", [want_headers])
         except Exception:
             pass
     _ws_cache[name] = ws
     return ws
 
-# ---- Clanlist cache ----
+# ---------- Clanlist & tag matching ----------
 _clan_tags_cache: List[str] = []
+_clan_tags_norm_set: set = set()
 _last_clan_fetch = 0.0
+_tag_regex_cache = None
+_tag_regex_key = ""
+
+def _normalize_dashes(s: str) -> str:
+    # en/em/figure/non-breaking hyphens -> ASCII '-'
+    return re.sub(r"[\u2010\u2011\u2012\u2013\u2014\u2015]", "-", s or "")
+
+def _fmt_ticket(s: str) -> str:
+    return (s or "").strip().lstrip("#").zfill(4)
 
 def _load_clan_tags(force: bool=False) -> List[str]:
-    """Read clan tags from 'clanlist'. Uses 'clantag' column if present; else first column."""
-    global _clan_tags_cache, _last_clan_fetch
+    global _clan_tags_cache, _clan_tags_norm_set, _last_clan_fetch, _tag_regex_cache, _tag_regex_key
     now = time.time()
     if not force and _clan_tags_cache and (now - _last_clan_fetch < 300):
         return _clan_tags_cache
@@ -134,27 +144,57 @@ def _load_clan_tags(force: bool=False) -> List[str]:
             col = header.index("clantag") if "clantag" in header else 0
             for row in values[1:]:
                 if col < len(row):
-                    t = (row[col] or "").strip().upper()
+                    t = _normalize_dashes(row[col]).strip().upper()
                     if t: tags.append(t)
         _clan_tags_cache = list(dict.fromkeys(tags))
+        _clan_tags_norm_set = { _normalize_dashes(t).upper() for t in _clan_tags_cache }
         _last_clan_fetch = now
+        # rebuild combined regex
+        parts = sorted((_normalize_dashes(t).upper() for t in _clan_tags_cache), key=len, reverse=True)
+        if parts:
+            # boundary = not [A-Za-z0-9_ ] around the tag (so hyphens inside tag are fine)
+            alt = "|".join(re.escape(p) for p in parts)
+            _tag_regex_cache = re.compile(rf"(?<![A-Za-z0-9_])(?:{alt})(?![A-Za-z0-9_])", re.IGNORECASE)
+            _tag_regex_key = "|".join(parts)
+        else:
+            _tag_regex_cache = None
+            _tag_regex_key = ""
     except Exception as e:
         print("Failed to load clanlist:", e, flush=True)
-        _clan_tags_cache = []
+        _clan_tags_cache = []; _clan_tags_norm_set = set(); _tag_regex_cache = None; _tag_regex_key = ""
     return _clan_tags_cache
 
-# ---- Ticket formatting ----
-def _fmt_ticket(s: str) -> str:
-    """Normalize to 4 digits with leading zeros, strip any leading '#'. """
-    return (s or "").strip().lstrip("#").zfill(4)
+def _match_tag_in_text(text: str) -> Optional[str]:
+    if not text: return None
+    _load_clan_tags(False)
+    if not _tag_regex_cache: return None
+    s = _normalize_dashes(text).upper()
+    m = _tag_regex_cache.search(s)
+    return m.group(0).upper() if m else None
 
+def _pick_tag_by_suffix(remainder: str, known_tags: List[str]) -> Optional[Tuple[str, str]]:
+    # try suffix built from last 1..3 segments
+    s = _normalize_dashes(remainder).strip()
+    parts = [p for p in s.split("-") if p != ""]
+    if not parts:
+        return None
+    norm_tags = _clan_tags_norm_set or { _normalize_dashes(t).upper() for t in known_tags }
+    max_k = min(3, len(parts))
+    for k in range(max_k, 0, -1):  # longest first
+        cand = "-".join(parts[-k:]).upper()
+        if cand in norm_tags:
+            username = "-".join(parts[:-k])
+            return (username.strip(), cand)
+    return None
+
+# ---------- Indexers ----------
 def _key_promo(ticket: str, typ: str, created: str) -> str:
     return f"{_fmt_ticket(ticket)}||{(typ or '').strip().lower()}||{(created or '').strip()}"
 
 def ws_index_welcome(name: str, ws) -> Dict[str,int]:
     idx = {}
     try:
-        colA = ws.col_values(1)[1:]  # skip header
+        colA = ws.col_values(1)[1:]
         for i, val in enumerate(colA, start=2):
             t = _fmt_ticket(val)
             if t: idx[t] = i
@@ -181,9 +221,8 @@ def ws_index_promo(name: str, ws) -> Dict[str,int]:
     _index_promo[name] = idx
     return idx
 
-# ---- helpers for diffs & verification ----
+# ---------- Diff / verify helpers ----------
 def _verify_find_exact(ws, value: str) -> Optional[int]:
-    """Return row of exact match in col A, else None."""
     try:
         cell = ws.find(f"^{re.escape(value)}$", in_column=1, regex=True)
         if cell: return cell.row
@@ -197,9 +236,6 @@ def _verify_find_exact(ws, value: str) -> Optional[int]:
     except Exception:
         pass
     return None
-
-def _row_as_dict(header: List[str], row: List[str]) -> Dict[str,str]:
-    return { (header[i] if i < len(header) else f"col{i}").lower(): (row[i] if i < len(row) else "") for i in range(len(header)) }
 
 def _calc_diffs(header: List[str], before: List[str], after: List[str]) -> List[str]:
     diffs = []
@@ -215,8 +251,8 @@ def _new_bucket():
     return {
         "scanned":0,"added":0,"updated":0,"skipped":0,
         "added_ids":[], "updated_ids":[], "skipped_ids":[],
-        "updated_details":[],                # ["0261: date closed '...' → '...'; clantag 'A' → 'B'"]
-        "skipped_reasons":{}                 # id -> reason
+        "updated_details":[],
+        "skipped_reasons":{}
     }
 
 backfill_state = {
@@ -226,7 +262,7 @@ backfill_state = {
     "last_msg": ""
 }
 
-# ---- VERIFIED upserts + promo fallback update (with diffs) ----
+# ---------- Upserts (with diffs) ----------
 def upsert_welcome(name: str, ws, ticket: str, rowvals: List[str], st_bucket: dict) -> str:
     ticket = _fmt_ticket(ticket)
     idx = _index_simple.get(name) or ws_index_welcome(name, ws)
@@ -241,7 +277,6 @@ def upsert_welcome(name: str, ws, ticket: str, rowvals: List[str], st_bucket: di
             if diffs:
                 st_bucket["updated_details"].append(f"{ticket}: " + "; ".join(diffs))
             return "updated"
-        # append as RAW so "0007" stays "0007"
         before_len = len(ws.col_values(1))
         ws.append_row(rowvals, value_input_option="RAW")
         after_len = len(ws.col_values(1))
@@ -256,7 +291,6 @@ def upsert_welcome(name: str, ws, ticket: str, rowvals: List[str], st_bucket: di
         return "error"
 
 def _find_promo_row_pair(ws, ticket: str, typ: str) -> Optional[int]:
-    """Fallback: find row with same (ticket, type), ignoring 'thread created' (for legacy rows)."""
     try:
         values = ws.get_all_values()
         if not values: return None
@@ -287,7 +321,6 @@ def upsert_promo(name: str, ws, ticket: str, typ: str, created_str: str, rowvals
             if diffs:
                 st_bucket["updated_details"].append(f"{ticket}:{typ}:{created_str}: " + "; ".join(diffs))
             return "updated"
-        # fallback: update old (ticket,type) row that lacks created
         rpair = _find_promo_row_pair(ws, ticket, typ)
         if rpair:
             before = ws.row_values(rpair)
@@ -298,7 +331,6 @@ def upsert_promo(name: str, ws, ticket: str, typ: str, created_str: str, rowvals
             if diffs:
                 st_bucket["updated_details"].append(f"{ticket}:{typ}:{created_str}: " + "; ".join(diffs))
             return "updated"
-        # else insert new (RAW to preserve 0000)
         before_len = len(ws.col_values(1))
         ws.append_row(rowvals, value_input_option="RAW")
         after_len = len(ws.col_values(1))
@@ -312,7 +344,6 @@ def upsert_promo(name: str, ws, ticket: str, typ: str, created_str: str, rowvals
         return "error"
 
 def dedupe_sheet(name: str, ws, has_type: bool=False) -> Tuple[int,int]:
-    """If has_type=True (Sheet4), dedupe by (ticket,type,created). Else by ticket only; keep newest by date closed."""
     values = ws.get_all_values()
     if len(values) <= 1: return (0,0)
     rows = values[1:]
@@ -355,7 +386,7 @@ def dedupe_sheet(name: str, ws, has_type: bool=False) -> Tuple[int,int]:
     else: ws_index_welcome(name, ws)
     return (len(winners), deleted)
 
-# ---------- Parsing (clanlist-aware) ----------
+# ---------- Parsing + inference ----------
 WELCOME_START_RX = re.compile(r'(?i)^closed-(\d{4})-(.+)$')
 PROMO_START_RX   = re.compile(r'(?i)^.*?(\d{4})-(.+)$')
 
@@ -363,49 +394,50 @@ def _clean_username(s: str) -> str:
     s = (s or "").strip()
     return re.sub(r'^[\s\-]+|[\s\-]+$', '', s)
 
-def _pick_tag_by_suffix(remainder: str, known_tags: List[str]) -> Optional[Tuple[str, str]]:
-    """Match '-TAG' where TAG is in known_tags (case-insensitive). Longest tag first."""
-    s = remainder.strip()
-    lower = s.lower()
-    for tag in sorted(known_tags, key=len, reverse=True):
-        t = tag.lower()
-        if lower.endswith("-" + t):
-            username = s[:-(len(tag) + 1)]
-            return (username.strip(), tag.upper())
-    return None
+def _aggregate_msg_text(msg: discord.Message) -> str:
+    parts = [msg.content or ""]
+    for e in msg.embeds or []:
+        parts += [e.title or "", e.description or ""]
+        if e.author and e.author.name: parts.append(e.author.name)
+        for f in e.fields or []:
+            parts += [f.name or "", f.value or ""]
+    return " | ".join(parts)
 
-async def find_close_timestamp(thread: discord.Thread) -> Optional[datetime]:
+async def infer_clantag_from_thread(thread: discord.Thread) -> Optional[str]:
+    """Newest wins: scan messages for the latest clan tag that matches clanlist."""
+    if not ENABLE_INFER_TAG_FROM_THREAD:
+        return None
     try: await thread.join()
     except Exception: pass
     try:
         async for msg in thread.history(limit=500, oldest_first=False):
-            parts = [msg.content or ""]
-            for e in msg.embeds or []:
-                parts += [e.title or "", e.description or ""]
-                if e.author and e.author.name: parts.append(e.author.name)
-                for f in e.fields or []: parts += [f.name or "", f.value or ""]
-            if "ticket closed by" in " | ".join(parts).lower():
-                return msg.created_at
-    except discord.Forbidden: pass
-    except Exception: pass
+            text = _aggregate_msg_text(msg)
+            tag = _match_tag_in_text(text)
+            if tag:
+                return tag  # newest match
+    except discord.Forbidden:
+        return None
+    except Exception:
+        return None
     return None
 
-def parse_welcome_thread_name(name: str) -> Optional[Tuple[str,str,str]]:
-    """Closed-0000-username-CLANTAG (CLANTAG must exist)."""
+def parse_welcome_thread_name_allow_missing(name: str) -> Optional[Tuple[str,str,Optional[str]]]:
+    """
+    Try to parse ticket + username from title; tag may be None if title lacks it.
+    """
     if not name: return None
     m = WELCOME_START_RX.match(name.strip())
     if not m: return None
     ticket = _fmt_ticket(m.group(1))
     remainder = m.group(2)
+
     picked = _pick_tag_by_suffix(remainder, _load_clan_tags())
     if picked:
         username, tag = picked
         return (ticket, _clean_username(username), tag)
-    # fallback: last '-' split
-    if "-" in remainder:
-        u, t = remainder.rsplit("-", 1)
-        return (ticket, _clean_username(u), (t or "").strip().upper())
-    return None
+
+    # don't guess tag by last dash; just return username with no tag
+    return (ticket, _clean_username(_normalize_dashes(remainder)), None)
 
 def parse_promo_thread_name(name: str) -> Optional[Tuple[str,str,str]]:
     """Closed-0000-username[-CLANTAG] (tag optional)."""
@@ -420,9 +452,23 @@ def parse_promo_thread_name(name: str) -> Optional[Tuple[str,str,str]]:
         return (ticket, _clean_username(username), tag)
     return (ticket, _clean_username(remainder), "")
 
+async def find_close_timestamp(thread: discord.Thread) -> Optional[datetime]:
+    try: await thread.join()
+    except Exception: pass
+    try:
+        async for msg in thread.history(limit=500, oldest_first=False):
+            text = _aggregate_msg_text(msg)
+            if "ticket closed by" in text.lower():
+                return msg.created_at
+    except discord.Forbidden: pass
+    except Exception: pass
+    return None
+
 # ---------- Scans (with live progress) ----------
+def _new_report_bucket(): return _new_bucket()
+
 async def scan_welcome_channel(channel: discord.TextChannel, progress_cb=None):
-    st = backfill_state["welcome"] = _new_bucket()
+    st = backfill_state["welcome"] = _new_report_bucket()
     if not ENABLE_WELCOME_SCAN:
         backfill_state["last_msg"] = "welcome scan disabled"; return
 
@@ -433,13 +479,11 @@ async def scan_welcome_channel(channel: discord.TextChannel, progress_cb=None):
         await _handle_welcome_thread(th, ws, st)
         if progress_cb: await progress_cb()
 
-    # active (unarchived) threads
     try:
         for th in channel.threads:
             await handle(th)
     except Exception: pass
 
-    # archived: public + private
     try:
         async for th in channel.archived_threads(limit=None, private=False):
             await handle(th)
@@ -453,12 +497,19 @@ async def scan_welcome_channel(channel: discord.TextChannel, progress_cb=None):
 
 async def _handle_welcome_thread(th: discord.Thread, ws, st):
     st["scanned"] += 1
-    parsed = parse_welcome_thread_name(th.name or "")
+    parsed = parse_welcome_thread_name_allow_missing(th.name or "")
     if not parsed:
         key = f"name:{th.name}"
         st["skipped"] += 1; st["skipped_ids"].append(key); st["skipped_reasons"][key] = "name parse fail"
         return
     ticket, username, clantag = parsed
+
+    # infer tag from newest message if missing
+    if not clantag:
+        inferred = await infer_clantag_from_thread(th)
+        if inferred: clantag = inferred
+        else: clantag = ""  # leave blank if none found
+
     dt = await find_close_timestamp(th)
     date_str = fmt_tz(dt or datetime.utcnow().replace(tzinfo=_tz.utc))
     row = [ticket, username, clantag, date_str]
@@ -471,7 +522,7 @@ async def _handle_welcome_thread(th: discord.Thread, ws, st):
         st["skipped"] += 1; st["skipped_ids"].append(ticket); st["skipped_reasons"].setdefault(ticket, "unknown")
 
 async def scan_promo_channel(channel: discord.TextChannel, progress_cb=None):
-    st = backfill_state["promo"] = _new_bucket()
+    st = backfill_state["promo"] = _new_report_bucket()
     if not ENABLE_PROMO_SCAN:
         backfill_state["last_msg"] = "promo scan disabled"; return
 
@@ -521,6 +572,26 @@ async def _handle_promo_thread(th: discord.Thread, ws, st):
     else:
         st["skipped"] += 1; st["skipped_ids"].append(key); st["skipped_reasons"].setdefault(key, "unknown")
 
+# ---------- Promo type detection (unchanged) ----------
+PROMO_TYPE_PATTERNS = [
+    (re.compile(r"(?i)we['’]re excited to have you returning"), "returning player"),
+    (re.compile(r"(?i)thanks for sending in your move request"), "player move request"),
+    (re.compile(r"(?i)we['’]ve received your request to help one of your clan members find a new home"), "clan lead move request"),
+]
+
+async def detect_promo_type(thread: discord.Thread) -> Optional[str]:
+    try: await thread.join()
+    except Exception: pass
+    try:
+        async for msg in thread.history(limit=500, oldest_first=False):
+            text = _aggregate_msg_text(msg)
+            for rx, typ in PROMO_TYPE_PATTERNS:
+                if rx.search(text):
+                    return typ
+    except discord.Forbidden: pass
+    except Exception: pass
+    return None
+
 # ---------- Commands ----------
 def cmd_enabled(flag: bool):
     def deco(func):
@@ -566,18 +637,14 @@ async def cmd_backfill(ctx):
     backfill_state["running"] = True; backfill_state["last_msg"] = ""
     progress_msg = await ctx.reply("Starting backfill…", mention_author=False)
 
-    # live updater
     async def progress_loop():
         while backfill_state["running"]:
-            try:
-                await progress_msg.edit(content=_render_status())
-            except Exception:
-                pass
+            try: await progress_msg.edit(content=_render_status())
+            except Exception: pass
             await asyncio.sleep(5.0)
     updater_task = asyncio.create_task(progress_loop())
 
     try:
-        # simple callback to ping the updater more often
         async def tick(): 
             try: await progress_msg.edit(content=_render_status())
             except Exception: pass
@@ -623,7 +690,6 @@ async def cmd_backfill_status(ctx):
 
 @bot.command(name="backfill_details")
 async def cmd_backfill_details(ctx: commands.Context):
-    """Attachment with UPDATED diffs + ALL SKIPPED (ids + reason)."""
     w = backfill_state["welcome"]; p = backfill_state["promo"]
     def section(title, lines):
         return [title] + (lines if lines else ["(none)"]) + [""]
@@ -636,25 +702,16 @@ async def cmd_backfill_details(ctx: commands.Context):
     buf = io.BytesIO(data.encode("utf-8"))
     await ctx.reply(file=discord.File(buf, filename="backfill_details.txt"), mention_author=False)
 
-@bot.command(name="sheet_debug")
-async def cmd_sheet_debug(ctx: commands.Context):
-    try:
-        ws1 = get_ws(SHEET1_NAME, HEADERS_SHEET1)
-        ws4 = get_ws(SHEET4_NAME, HEADERS_SHEET4)
-        title = ws1.spreadsheet.title
-        last1 = ws1.get(f"A{max(2, ws1.row_count-5)}:D{ws1.row_count}")
-        last4 = ws4.get(f"A{max(2, ws4.row_count-5)}:F{ws4.row_count}")
-        def fmt_tail(rows):
-            rows = [r for r in rows if any(c for c in r)]
-            return "\n".join(" | ".join(r) for r in rows[-5:]) or "(no rows)"
-        await ctx.reply(
-            f"Spreadsheet: **{title}**\n"
-            f"Tab `{SHEET1_NAME}` tail:\n```\n{fmt_tail(last1)}\n```\n"
-            f"Tab `{SHEET4_NAME}` tail:\n```\n{fmt_tail(last4)}\n```",
-            mention_author=False
-        )
-    except Exception as e:
-        await ctx.reply(f"sheet_debug failed: `{e}`", mention_author=False)
+@bot.command(name="clan_tags_debug")
+async def cmd_clan_tags_debug(ctx):
+    tags = _load_clan_tags(force=True)
+    norm_set = { _normalize_dashes(t).upper() for t in tags }
+    has_fit = "F-IT" in norm_set
+    sample = ", ".join(list(tags)[:20]) or "(none)"
+    await ctx.reply(
+        f"Loaded {len(tags)} clan tags. Has F-IT: {has_fit}\nSample: {sample}",
+        mention_author=False
+    )
 
 @bot.command(name="dedupe_sheet")
 @cmd_enabled(ENABLE_CMD_DEDUPE)
@@ -676,8 +733,8 @@ async def cmd_dedupe(ctx):
 @cmd_enabled(ENABLE_CMD_RELOAD)
 async def cmd_reload(ctx):
     _ws_cache.clear(); _index_simple.clear(); _index_promo.clear()
-    global _gs_client, _clan_tags_cache, _last_clan_fetch
-    _gs_client = None; _clan_tags_cache = []; _last_clan_fetch = 0.0
+    global _gs_client, _clan_tags_cache, _clan_tags_norm_set, _last_clan_fetch, _tag_regex_cache, _tag_regex_key
+    _gs_client = None; _clan_tags_cache = []; _clan_tags_norm_set = set(); _last_clan_fetch = 0.0; _tag_regex_cache=None; _tag_regex_key=""
     await ctx.reply("Caches cleared. Reconnect to Sheets on next use.", mention_author=False)
 
 @bot.command(name="health")
