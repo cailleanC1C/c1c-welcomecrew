@@ -893,6 +893,16 @@ def _red(s: str, keep: int = 6) -> str:
     if len(s) <= keep: return "*" * len(s)
     return s[:keep] + "…" + "*" * 6
 
+# --- slash sync (ensure /help appears) ---
+@bot.event
+async def setup_hook():
+    try:
+        await bot.tree.sync()
+        print("Slash commands synced.", flush=True)
+    except Exception as e:
+        print(f"Slash sync failed: {e}", flush=True)
+
+
 @bot.command(name="env_check")
 async def cmd_env_check(ctx):
     def ok(b): return "✅" if b else "❌"
@@ -1266,5 +1276,6 @@ else:
         _print_boot_info()
         if TOKEN: bot.run(TOKEN)
         else: print("FATAL: DISCORD_TOKEN/TOKEN not set.", flush=True)
+
 
 
