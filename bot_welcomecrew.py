@@ -1,7 +1,10 @@
-# C1C – WelcomeCrew (v12)
-# Adds: infer clan tag from latest thread message for Welcome (title may lack tag).
-# Keeps: live progress, detailed diffs, clanlist-aware parsing (F-IT safe), 4-digit tickets,
-# movers key = ticket+type+thread created, verified upserts.
+# C1C – WelcomeCrew (v13)
+# - Live backfill with progress + clean stop (!backfill_stop)
+# - Clanlist-aware tag parsing (tags from column B by default), F-IT safe
+# - Welcome: infer clantag from latest message if title lacks it
+# - 4-digit ticket normalization; movers keyed by ticket+type+thread-created
+# - Verified appends; detailed diffs for updates; full skip reasons
+# - Active + archived thread scanning
 
 import os, json, re, asyncio, time, io
 from datetime import datetime, timezone as _tz
@@ -30,10 +33,11 @@ TIMEZONE           = os.getenv("TIMEZONE", "UTC")
 SHEET1_NAME        = os.getenv("SHEET1_NAME", "Sheet1")
 SHEET4_NAME        = os.getenv("SHEET4_NAME", "Sheet4")
 CLANLIST_TAB_NAME  = os.getenv("CLANLIST_TAB_NAME", "clanlist")
+# Which column in clanlist has the tags? (1-based; default 2 => column B)
+CLANLIST_TAG_COLUMN = int(os.getenv("CLANLIST_TAG_COLUMN", "2"))
 
-# Toggle: try to infer tag from thread when welcome title lacks it (ON/OFF)
+# Feature toggles
 ENABLE_INFER_TAG_FROM_THREAD = env_bool("ENABLE_INFER_TAG_FROM_THREAD", True)
-
 ENABLE_WELCOME_SCAN        = env_bool("ENABLE_WELCOME_SCAN", True)
 ENABLE_PROMO_SCAN          = env_bool("ENABLE_PROMO_SCAN", True)
 ENABLE_CMD_SHEETSTATUS     = env_bool("ENABLE_CMD_SHEETSTATUS", True)
@@ -46,9 +50,6 @@ ENABLE_CMD_PING            = env_bool("ENABLE_CMD_PING", True)
 ENABLE_CMD_CHECKSHEET      = env_bool("ENABLE_CMD_CHECKSHEET", True)
 ENABLE_CMD_REBOOT          = env_bool("ENABLE_CMD_REBOOT", True)
 ENABLE_WEB_SERVER          = env_bool("ENABLE_WEB_SERVER", True)
-
-CLANLIST_TAG_COLUMN = int(os.getenv("CLANLIST_TAG_COLUMN", "2"))  # 1-based; default B
-
 
 # ---------- Discord ----------
 intents = discord.Intents.default()
@@ -70,8 +71,8 @@ def fmt_tz(dt: datetime) -> str:
     return (dt or datetime.utcnow().replace(tzinfo=_tz.utc)).strftime("%Y-%m-%d %H:%M")
 
 def _print_boot_info():
-    print("=== WelcomeCrew v12 boot ===", flush=True)
-    print(f"Sheets: {SHEET1_NAME} / {SHEET4_NAME} / clanlist:{CLANLIST_TAB_NAME}", flush=True)
+    print("=== WelcomeCrew v13 boot ===", flush=True)
+    print(f"Sheets: {SHEET1_NAME} / {SHEET4_NAME} / clanlist:{CLANLIST_TAB_NAME} (tags col={CLANLIST_TAG_COLUMN})", flush=True)
     print(f"Welcome={WELCOME_CHANNEL_ID} Promo={PROMO_CHANNEL_ID}", flush=True)
     print(f"TZ={TIMEZONE} | infer-from-thread={ENABLE_INFER_TAG_FROM_THREAD}", flush=True)
 
@@ -132,16 +133,6 @@ def _normalize_dashes(s: str) -> str:
 def _fmt_ticket(s: str) -> str:
     return (s or "").strip().lstrip("#").zfill(4)
 
-# ---- Clanlist cache ----
-_clan_tags_cache: List[str] = []
-_clan_tags_norm_set: set = set()
-_last_clan_fetch = 0.0
-_tag_regex_cache = None
-_tag_regex_key = ""
-
-def _normalize_dashes(s: str) -> str:
-    return re.sub(r"[\u2010\u2011\u2012\u2013\u2014\u2015]", "-", s or "")
-
 def _load_clan_tags(force: bool=False) -> List[str]:
     global _clan_tags_cache, _clan_tags_norm_set, _last_clan_fetch, _tag_regex_cache, _tag_regex_key
     now = time.time()
@@ -155,28 +146,24 @@ def _load_clan_tags(force: bool=False) -> List[str]:
         values = ws.get_all_values() or []
         if values:
             header = [h.strip().lower() for h in values[0]] if values else []
-            # Prefer a header if present; otherwise use the configured column (B by default)
+            # Prefer header if present; else configured column (1-based; default 2 => B)
             col_idx = None
             for key in ("clantag", "tag", "abbr", "code"):
                 if key in header:
                     col_idx = header.index(key)
                     break
             if col_idx is None:
-                # env is 1-based
                 col_idx = max(0, CLANLIST_TAG_COLUMN - 1)
-
             for row in values[1:]:
                 cell = row[col_idx] if col_idx < len(row) else ""
                 t = _normalize_dashes(cell).strip().upper()
                 if t:
                     tags.append(t)
 
-        # dedupe while preserving order
         _clan_tags_cache = list(dict.fromkeys(tags))
         _clan_tags_norm_set = { _normalize_dashes(t).upper() for t in _clan_tags_cache }
         _last_clan_fetch = now
 
-        # rebuild combined regex (longest first)
         parts = sorted((_normalize_dashes(t).upper() for t in _clan_tags_cache), key=len, reverse=True)
         if parts:
             alt = "|".join(re.escape(p) for p in parts)
@@ -199,14 +186,17 @@ def _match_tag_in_text(text: str) -> Optional[str]:
     return m.group(0).upper() if m else None
 
 def _pick_tag_by_suffix(remainder: str, known_tags: List[str]) -> Optional[Tuple[str, str]]:
-    # try suffix built from last 1..3 segments
+    """
+    Try to find a '-TAG' suffix where TAG is in known_tags.
+    Supports multi-segment tags like 'F-IT'. Checks last 1..3 segments.
+    """
     s = _normalize_dashes(remainder).strip()
     parts = [p for p in s.split("-") if p != ""]
     if not parts:
         return None
     norm_tags = _clan_tags_norm_set or { _normalize_dashes(t).upper() for t in known_tags }
-    max_k = min(3, len(parts))
-    for k in range(max_k, 0, -1):  # longest first
+    max_k = min(3, len(parts))  # allow up to 3-part tags
+    for k in range(max_k, 0, -1):  # longest suffix first
         cand = "-".join(parts[-k:]).upper()
         if cand in norm_tags:
             username = "-".join(parts[:-k])
@@ -449,7 +439,7 @@ async def infer_clantag_from_thread(thread: discord.Thread) -> Optional[str]:
 
 def parse_welcome_thread_name_allow_missing(name: str) -> Optional[Tuple[str,str,Optional[str]]]:
     """
-    Try to parse ticket + username from title; tag may be None if title lacks it.
+    Parse ticket + username from title; tag may be None if title lacks it.
     """
     if not name: return None
     m = WELCOME_START_RX.match(name.strip())
@@ -462,7 +452,7 @@ def parse_welcome_thread_name_allow_missing(name: str) -> Optional[Tuple[str,str
         username, tag = picked
         return (ticket, _clean_username(username), tag)
 
-    # don't guess tag by last dash; just return username with no tag
+    # no reliable tag in title; just return the username (tag=None)
     return (ticket, _clean_username(_normalize_dashes(remainder)), None)
 
 def parse_promo_thread_name(name: str) -> Optional[Tuple[str,str,str]]:
@@ -490,7 +480,7 @@ async def find_close_timestamp(thread: discord.Thread) -> Optional[datetime]:
     except Exception: pass
     return None
 
-# ---------- Scans (with live progress) ----------
+# ---------- Scans (live progress + cancel-safe) ----------
 def _new_report_bucket(): return _new_bucket()
 
 async def scan_welcome_channel(channel: discord.TextChannel, progress_cb=None):
@@ -502,26 +492,31 @@ async def scan_welcome_channel(channel: discord.TextChannel, progress_cb=None):
     ws_index_welcome(SHEET1_NAME, ws)
 
     async def handle(th: discord.Thread):
+        if not backfill_state["running"]: return
         await _handle_welcome_thread(th, ws, st)
         if progress_cb: await progress_cb()
 
     try:
         for th in channel.threads:
+            if not backfill_state["running"]: break
             await handle(th)
     except Exception: pass
 
     try:
         async for th in channel.archived_threads(limit=None, private=False):
+            if not backfill_state["running"]: break
             await handle(th)
     except discord.Forbidden:
         backfill_state["last_msg"] += " | no access to public archived welcome threads"
     try:
         async for th in channel.archived_threads(limit=None, private=True):
+            if not backfill_state["running"]: break
             await handle(th)
     except discord.Forbidden:
         backfill_state["last_msg"] += " | no access to private archived welcome threads"
 
 async def _handle_welcome_thread(th: discord.Thread, ws, st):
+    if not backfill_state["running"]: return
     st["scanned"] += 1
     parsed = parse_welcome_thread_name_allow_missing(th.name or "")
     if not parsed:
@@ -529,13 +524,9 @@ async def _handle_welcome_thread(th: discord.Thread, ws, st):
         st["skipped"] += 1; st["skipped_ids"].append(key); st["skipped_reasons"][key] = "name parse fail"
         return
     ticket, username, clantag = parsed
-
-    # infer tag from newest message if missing
     if not clantag:
         inferred = await infer_clantag_from_thread(th)
-        if inferred: clantag = inferred
-        else: clantag = ""  # leave blank if none found
-
+        clantag = inferred or ""
     dt = await find_close_timestamp(th)
     date_str = fmt_tz(dt or datetime.utcnow().replace(tzinfo=_tz.utc))
     row = [ticket, username, clantag, date_str]
@@ -556,26 +547,31 @@ async def scan_promo_channel(channel: discord.TextChannel, progress_cb=None):
     ws_index_promo(SHEET4_NAME, ws)
 
     async def handle(th: discord.Thread):
+        if not backfill_state["running"]: return
         await _handle_promo_thread(th, ws, st)
         if progress_cb: await progress_cb()
 
     try:
         for th in channel.threads:
+            if not backfill_state["running"]: break
             await handle(th)
     except Exception: pass
 
     try:
         async for th in channel.archived_threads(limit=None, private=False):
+            if not backfill_state["running"]: break
             await handle(th)
     except discord.Forbidden:
         backfill_state["last_msg"] += " | no access to public archived promo threads"
     try:
         async for th in channel.archived_threads(limit=None, private=True):
+            if not backfill_state["running"]: break
             await handle(th)
     except discord.Forbidden:
         backfill_state["last_msg"] += " | no access to private archived promo threads"
 
 async def _handle_promo_thread(th: discord.Thread, ws, st):
+    if not backfill_state["running"]: return
     st["scanned"] += 1
     parsed = parse_promo_thread_name(th.name or "")
     if not parsed:
@@ -598,13 +594,12 @@ async def _handle_promo_thread(th: discord.Thread, ws, st):
     else:
         st["skipped"] += 1; st["skipped_ids"].append(key); st["skipped_reasons"].setdefault(key, "unknown")
 
-# ---------- Promo type detection (unchanged) ----------
+# ---------- Promo type detection ----------
 PROMO_TYPE_PATTERNS = [
     (re.compile(r"(?i)we['’]re excited to have you returning"), "returning player"),
     (re.compile(r"(?i)thanks for sending in your move request"), "player move request"),
     (re.compile(r"(?i)we['’]ve received your request to help one of your clan members find a new home"), "clan lead move request"),
 ]
-
 async def detect_promo_type(thread: discord.Thread) -> Optional[str]:
     try: await thread.join()
     except Exception: pass
@@ -641,7 +636,7 @@ async def cmd_sheetstatus(ctx):
         ws4 = get_ws(SHEET4_NAME, HEADERS_SHEET4)
         title = ws1.spreadsheet.title
         await ctx.reply(
-            f"✅ Sheets OK: **{title}**\n• Tabs: `{SHEET1_NAME}`, `{SHEET4_NAME}`, `{CLANLIST_TAB_NAME}`\n• Share with: `{email}`",
+            f"✅ Sheets OK: **{title}**\n• Tabs: `{SHEET1_NAME}`, `{SHEET4_NAME}`, `{CLANLIST_TAB_NAME}` (tags col {CLANLIST_TAG_COLUMN})\n• Share with: `{email}`",
             mention_author=False
         )
     except Exception as e:
@@ -671,7 +666,7 @@ async def cmd_backfill(ctx):
     updater_task = asyncio.create_task(progress_loop())
 
     try:
-        async def tick(): 
+        async def tick():
             try: await progress_msg.edit(content=_render_status())
             except Exception: pass
 
@@ -690,6 +685,14 @@ async def cmd_backfill(ctx):
 
     await progress_msg.edit(content=_render_status() + "\nDone.")
     await _post_short_report(ctx)
+
+@bot.command(name="backfill_stop")
+async def cmd_backfill_stop(ctx):
+    if not backfill_state["running"]:
+        return await ctx.reply("No backfill is running.", mention_author=False)
+    backfill_state["running"] = False
+    backfill_state["last_msg"] = "cancel requested"
+    await ctx.reply("Stopping backfill… will halt after the current thread.", mention_author=False)
 
 def _fmt_list(ids: List[str], max_items=10) -> str:
     if not ids: return "—"
@@ -716,6 +719,7 @@ async def cmd_backfill_status(ctx):
 
 @bot.command(name="backfill_details")
 async def cmd_backfill_details(ctx: commands.Context):
+    """Attachment with UPDATED diffs + ALL SKIPPED (ids + reason)."""
     w = backfill_state["welcome"]; p = backfill_state["promo"]
     def section(title, lines):
         return [title] + (lines if lines else ["(none)"]) + [""]
@@ -826,4 +830,3 @@ else:
         _print_boot_info()
         if TOKEN: bot.run(TOKEN)
         else: print("FATAL: DISCORD_TOKEN/TOKEN not set.", flush=True)
-
