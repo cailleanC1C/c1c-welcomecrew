@@ -5,6 +5,7 @@
 # - Backfill leaves date blank if not closed; auto details attachment
 # - watch_status with last 5 actions
 # - Throttled/backoff Sheets writes; 4-digit tickets
+# -*- coding: utf-8 -*-
 
 import os, json, re, asyncio, time, io, random
 from datetime import datetime, timezone as _tz
@@ -892,15 +893,32 @@ async def detect_promo_type(thread: discord.Thread) -> Optional[str]:
 
 # ---------- Auto-post helper for details ----------
 def _build_backfill_details_text() -> str:
-    w = backfill_state["welcome"]; p = backfill_state["promo"]
-    def section(title, lines):
-        return [title] + (lines if lines else ["(none)"]) + [""]
+    # Be defensive in case state buckets are missing
+    w = backfill_state.get("welcome", _new_bucket())
+    p = backfill_state.get("promo", _new_bucket())
+
+    def section(title: str, rows: List[str]) -> List[str]:
+        out: List[str] = [title]
+        out.extend(rows if rows else ["(none)"])
+        out.append("")  # blank line
+        return out
+
+    w_updates = list(w.get("updated_details", []))
+    w_skipped_pairs = (w.get("skipped_reasons", {}) or {}).items()
+    w_skipped = [f"{k} -> {v}" for (k, v) in w_skipped_pairs]
+
+    p_updates = list(p.get("updated_details", []))
+    p_skipped_pairs = (p.get("skipped_reasons", {}) or {}).items()
+    p_skipped = [f"{k} -> {v}" for (k, v) in p_skipped_pairs]
+
     lines: List[str] = []
-    lines += section("WELCOME — UPDATED (with diffs):", w["updated_details"])
-    lines += section("WELCOME — SKIPPED (id -> reason):", [f"{k} -> {v}" for k,v in w["skipped_reasons"].items()])
-    lines += section("PROMO — UPDATED (with diffs):", p["updated_details"])
-    lines += section("PROMO — SKIPPED (id -> reason):", [f"{k} -> {v}" for k,v in p["skipped_reasons'].items()])
-    return "\n".join(lines) or "(empty)"
+    lines += section("WELCOME - UPDATED (with diffs):", w_updates)
+    lines += section("WELCOME - SKIPPED (id -> reason):", w_skipped)
+    lines += section("PROMO - UPDATED (with diffs):", p_updates)
+    lines += section("PROMO - SKIPPED (id -> reason):", p_skipped)
+
+    return "\n".join(lines) if lines else "(empty)"
+
 
 # ---------- Commands ----------
 def cmd_enabled(flag: bool):
@@ -1409,3 +1427,4 @@ else:
         _print_boot_info()
         if TOKEN: bot.run(TOKEN)
         else: print("FATAL: DISCORD_TOKEN/TOKEN not set.", flush=True)
+
