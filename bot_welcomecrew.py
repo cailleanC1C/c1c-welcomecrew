@@ -194,18 +194,18 @@ def _mk_help_embed_mobile(guild: discord.Guild | None = None) -> discord.Embed:
 
     # ——— Commands (two-line layout per item) ———
     commands_pairs = [
-        ("🔹!env_check",        "➖show required env + hints"),
-        ("🔹!sheetstatus",      "➖tabs + service account email"),
-        ("🔹!backfill_tickets", "➖scan threads, show live status"),
-        ("🔹!backfill_details", "➖upload diffs/skips as a file"),
-        ("🔹!dedupe_sheet",     "➖keep newest entry"),
-        ("🔹!watch_status",     "➖watcher ON/OFF + last actions"),
-        ("🔹!reload",           "➖clear sheet cache"),
-        ("🔹!checksheet",       "➖sheet row counts"),
-        ("🔹!health",           "➖bot & Sheets health"),
-        ("🔹!reboot",           "➖soft restart"),
+        ("!env_check",        "show required env + hints"),
+        ("!sheetstatus",      "tabs + service account email"),
+        ("!backfill_tickets", "scan threads, show live status"),
+        ("!backfill_details", "upload diffs/skips as a file"),
+        ("!dedupe_sheet",     "keep newest entry"),
+        ("!watch_status",     "watcher ON/OFF + last actions"),
+        ("!reload",           "clear sheet cache"),
+        ("!checksheet",       "sheet row counts"),
+        ("!health",           "bot & Sheets health"),
+        ("!reboot",           "soft restart"),
     ]
-    commands_lines = "\n".join([f"• `{cmd}`\n  → {desc}" for cmd, desc in commands_pairs])
+    commands_lines = "\n".join([f"🔹 `{cmd}`\n  → {desc}" for cmd, desc in commands_pairs])
     e.add_field(name="Commands — Admin & Maintenance", value=commands_lines, inline=False)
 
     # ——— Status ———
@@ -706,9 +706,21 @@ async def _prompt_for_tag(thread: discord.Thread, ticket: str, username: str, ms
 
 # ---------- Finalizers (log + optional rename) ----------
 async def _rename_welcome_thread_if_needed(thread: discord.Thread, ticket: str, username: str, clantag: str) -> bool:
+    """
+    Ensure welcome threads are named exactly: Closed-####-username-TAG
+    (keeps a single 'Closed-' prefix; avoids double-prefixing)
+    """
     try:
-        desired = f"{_fmt_ticket(ticket)}-{username}-{clantag}".strip("-")
-        if (thread.name or "").strip() != desired and clantag:
+        core = f"{_fmt_ticket(ticket)}-{username}-{clantag}".strip("-")
+        desired = f"Closed-{core}"
+        current = (thread.name or "").strip()
+
+        # normalize any variant like 'closed #### - user - TAG' to canonical 'Closed-####-user-TAG'
+        cur_norm = _normalize_dashes(current)
+        if cur_norm.lower().startswith("closed-"):
+            cur_norm = "Closed-" + cur_norm[7:]  # normalize case of prefix
+
+        if cur_norm != desired and clantag:
             await thread.edit(name=desired)
             return True
     except discord.Forbidden:
@@ -1284,6 +1296,7 @@ else:
         _print_boot_info()
         if TOKEN: bot.run(TOKEN)
         else: print("FATAL: DISCORD_TOKEN/TOKEN not set.", flush=True)
+
 
 
 
