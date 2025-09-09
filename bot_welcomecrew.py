@@ -396,3 +396,585 @@ def dedupe_sheet(name: str, ws, has_type: bool=False) -> Tuple[int,int]:
     keep_rows = {r for (r,_dt) in winners.values()}
     to_delete = [i for i,_ in enumerate(rows,start=2) if i not in keep_rows]
     deleted = 0
+    for r in sorted(to_delete, reverse=True):
+        try: ws.delete_rows(r); deleted += 1
+        except Exception: pass
+
+    if has_type: ws_index_promo(name, ws)
+    else: ws_index_welcome(name, ws)
+    return (len(winners), deleted)
+
+# ---------- Parsing + inference ----------
+WELCOME_START_RX = re.compile(r'(?i)^(?:closed[- ]*)?(\d{4})[- ]+(.+)$')
+PROMO_START_RX   = re.compile(r'(?i)^.*?(\d{4})-(.+)$')
+
+def _clean_username(s: str) -> str:
+    s = (s or "").strip()
+    return re.sub(r'^[\s\-]+|[\s\-]+$', '', s)
+
+def _aggregate_msg_text(msg: discord.Message) -> str:
+    parts = [msg.content or ""]
+    for e in msg.embeds or []:
+        parts += [e.title or "", e.description or ""]
+        if e.author and e.author.name: parts.append(e.author.name)
+        for f in e.fields or []:
+            parts += [f.name or "", f.value or ""]
+    return " | ".join(parts)
+
+async def infer_clantag_from_thread(thread: discord.Thread) -> Optional[str]:
+    if not ENABLE_INFER_TAG_FROM_THREAD:
+        return None
+    try: await thread.join()
+    except Exception: pass
+    try:
+        async for msg in thread.history(limit=500, oldest_first=False):
+            text = _aggregate_msg_text(msg)
+            tag = _match_tag_in_text(text)
+            if tag:
+                return tag
+    except discord.Forbidden:
+        return None
+    except Exception:
+        return None
+    return None
+
+def parse_welcome_thread_name_allow_missing(name: str) -> Optional[Tuple[str,str,Optional[str]]]:
+    if not name:
+        return None
+    s = _normalize_dashes(name).strip()
+
+    m = WELCOME_START_RX.match(s)
+    if not m:
+        m2 = re.search(r'(\d{4})', s)
+        if not m2:
+            return None
+        ticket = _fmt_ticket(m2.group(1))
+        remainder = s[m2.end():].lstrip(" -")
+    else:
+        ticket = _fmt_ticket(m.group(1))
+        remainder = m.group(2)
+
+    picked = _pick_tag_by_suffix(remainder, _load_clan_tags())
+    if picked:
+        username, tag = picked
+        return (ticket, _clean_username(username), tag)
+
+    any_tag = _match_tag_in_text(remainder)
+    if any_tag:
+        left = remainder.upper().split(any_tag.upper(), 1)[0]
+        left = re.sub(r'\bclosed\b', '', left, flags=re.IGNORECASE)
+        return (ticket, _clean_username(left), any_tag)
+
+    return (ticket, _clean_username(remainder), None)
+
+def parse_promo_thread_name(name: str) -> Optional[Tuple[str,str,str]]:
+    if not name: return None
+    m = PROMO_START_RX.match((name or "").strip())
+    if not m: return None
+    ticket = _fmt_ticket(m.group(1))
+    remainder = m.group(2)
+    picked = _pick_tag_by_suffix(remainder, _load_clan_tags())
+    if picked:
+        username, tag = picked
+        return (ticket, _clean_username(username), tag)
+    return (ticket, _clean_username(remainder), "")
+
+async def find_close_timestamp(thread: discord.Thread) -> Optional[datetime]:
+    try: await thread.join()
+    except Exception: pass
+    try:
+        async for msg in thread.history(limit=500, oldest_first=False):
+            text = _aggregate_msg_text(msg)
+            if "ticket closed by" in text.lower():
+                return msg.created_at
+    except discord.Forbidden: pass
+    except Exception: pass
+    return None
+
+# ---------- Scans (live progress + cancel-safe) ----------
+def _new_report_bucket(): return _new_bucket()
+
+async def scan_welcome_channel(channel: discord.TextChannel, progress_cb=None):
+    st = backfill_state["welcome"] = _new_report_bucket()
+    if not ENABLE_WELCOME_SCAN:
+        backfill_state["last_msg"] = "welcome scan disabled"; return
+
+    ws = get_ws(SHEET1_NAME, HEADERS_SHEET1)
+    ws_index_welcome(SHEET1_NAME, ws)
+
+    async def handle(th: discord.Thread):
+        if not backfill_state["running"]: return
+        await _handle_welcome_thread(th, ws, st)
+        if progress_cb: await progress_cb()
+
+    try:
+        for th in channel.threads:
+            if not backfill_state["running"]: break
+            await handle(th)
+    except Exception: pass
+
+    try:
+        async for th in channel.archived_threads(limit=None, private=False):
+            if not backfill_state["running"]: break
+            await handle(th)
+    except discord.Forbidden:
+        backfill_state["last_msg"] += " | no access to public archived welcome threads"
+    try:
+        async for th in channel.archived_threads(limit=None, private=True):
+            if not backfill_state["running"]: break
+            await handle(th)
+    except discord.Forbidden:
+        backfill_state["last_msg"] += " | no access to private archived welcome threads"
+
+async def _handle_welcome_thread(th: discord.Thread, ws, st):
+    if not backfill_state["running"]: return
+    st["scanned"] += 1
+    parsed = parse_welcome_thread_name_allow_missing(th.name or "")
+    if not parsed:
+        key = f"name:{th.name}"
+        st["skipped"] += 1; st["skipped_ids"].append(key); st["skipped_reasons"][key] = "name parse fail"
+        return
+    ticket, username, clantag = parsed
+    if not clantag:
+        inferred = await infer_clantag_from_thread(th)
+        clantag = inferred or ""
+    dt = await find_close_timestamp(th)
+    date_str = fmt_tz(dt or datetime.utcnow().replace(tzinfo=_tz.utc))
+    row = [ticket, username, clantag, date_str]
+    status = upsert_welcome(SHEET1_NAME, ws, ticket, row, st)
+    if status == "inserted":
+        st["added"] += 1; st["added_ids"].append(ticket)
+    elif status == "updated":
+        st["updated"] += 1; st["updated_ids"].append(ticket)
+    else:
+        st["skipped"] += 1; st["skipped_ids"].append(ticket); st["skipped_reasons"].setdefault(ticket, "unknown")
+
+async def scan_promo_channel(channel: discord.TextChannel, progress_cb=None):
+    st = backfill_state["promo"] = _new_report_bucket()
+    if not ENABLE_PROMO_SCAN:
+        backfill_state["last_msg"] = "promo scan disabled"; return
+
+    ws = get_ws(SHEET4_NAME, HEADERS_SHEET4)
+    ws_index_promo(SHEET4_NAME, ws)
+
+    async def handle(th: discord.Thread):
+        if not backfill_state["running"]: return
+        await _handle_promo_thread(th, ws, st)
+        if progress_cb: await progress_cb()
+
+    try:
+        for th in channel.threads:
+            if not backfill_state["running"]: break
+            await handle(th)
+    except Exception: pass
+
+    try:
+        async for th in channel.archived_threads(limit=None, private=False):
+            if not backfill_state["running"]: break
+            await handle(th)
+    except discord.Forbidden:
+        backfill_state["last_msg"] += " | no access to public archived promo threads"
+    try:
+        async for th in channel.archived_threads(limit=None, private=True):
+            if not backfill_state["running"]: break
+            await handle(th)
+    except discord.Forbidden:
+        backfill_state["last_msg"] += " | no access to private archived promo threads"
+
+async def _handle_promo_thread(th: discord.Thread, ws, st):
+    if not backfill_state["running"]: return
+    st["scanned"] += 1
+    parsed = parse_promo_thread_name(th.name or "")
+    if not parsed:
+        key = f"name:{th.name}"
+        st["skipped"] += 1; st["skipped_ids"].append(key); st["skipped_reasons"][key] = "name parse fail"
+        return
+    ticket, username, clantag = parsed
+    typ = await detect_promo_type(th) or ""
+    dt_close = await find_close_timestamp(th)
+    date_str = fmt_tz(dt_close or datetime.utcnow().replace(tzinfo=_tz.utc))
+    created_str = fmt_tz(th.created_at)
+
+    row = [ticket, username, clantag, date_str, typ, created_str]
+    status = upsert_promo(SHEET4_NAME, ws, ticket, typ, created_str, row, st)
+    key = f"{ticket}:{typ or 'unknown'}:{created_str}"
+    if status == "inserted":
+        st["added"] += 1; st["added_ids"].append(key)
+    elif status == "updated":
+        st["updated"] += 1; st["updated_ids"].append(key)
+    else:
+        st["skipped"] += 1; st["skipped_ids"].append(key); st["skipped_reasons"].setdefault(key, "unknown")
+
+# ---------- Promo type detection ----------
+PROMO_TYPE_PATTERNS = [
+    (re.compile(r"(?i)we['’]re excited to have you returning"), "returning player"),
+    (re.compile(r"(?i)thanks for sending in your move request"), "player move request"),
+    (re.compile(r"(?i)we['’]ve received your request to help one of your clan members find a new home"), "clan lead move request"),
+]
+async def detect_promo_type(thread: discord.Thread) -> Optional[str]:
+    try: await thread.join()
+    except Exception: pass
+    try:
+        async for msg in thread.history(limit=500, oldest_first=False):
+            text = _aggregate_msg_text(msg)
+            for rx, typ in PROMO_TYPE_PATTERNS:
+                if rx.search(text):
+                    return typ
+    except discord.Forbidden: pass
+    except Exception: pass
+    return None
+
+# ---------- Auto-post helper for details ----------
+def _build_backfill_details_text() -> str:
+    w = backfill_state["welcome"]; p = backfill_state["promo"]
+    def section(title, lines):
+        return [title] + (lines if lines else ["(none)"]) + [""]
+    lines: List[str] = []
+    lines += section("WELCOME — UPDATED (with diffs):", w["updated_details"])
+    lines += section("WELCOME — SKIPPED (id -> reason):", [f"{k} -> {v}" for k,v in w["skipped_reasons"].items()])
+    lines += section("PROMO — UPDATED (with diffs):", p["updated_details"])
+    lines += section("PROMO — SKIPPED (id -> reason):", [f"{k} -> {v}" for k,v in p["skipped_reasons"].items()])
+    return "\n".join(lines) or "(empty)"
+
+# ---------- Commands ----------
+def cmd_enabled(flag: bool):
+    def deco(func):
+        async def wrapper(ctx: commands.Context, *a, **k):
+            if not flag:
+                return await ctx.reply("This command is disabled by env flag.", mention_author=False)
+            return await func(ctx, *a, **k)
+        return wrapper
+    return deco
+
+@bot.command(name="ping")
+@cmd_enabled(ENABLE_CMD_PING)
+async def cmd_ping(ctx): await ctx.reply("🏓 Pong — Live and listening.", mention_author=False)
+
+@bot.command(name="sheetstatus")
+@cmd_enabled(ENABLE_CMD_SHEETSTATUS)
+async def cmd_sheetstatus(ctx):
+    email = service_account_email() or "(no service account)"
+    try:
+        ws1 = get_ws(SHEET1_NAME, HEADERS_SHEET1)
+        ws4 = get_ws(SHEET4_NAME, HEADERS_SHEET4)
+        title = ws1.spreadsheet.title
+        await ctx.reply(
+            f"✅ Sheets OK: **{title}**\n• Tabs: `{SHEET1_NAME}`, `{SHEET4_NAME}`, `{CLANLIST_TAB_NAME}` (tags col {CLANLIST_TAG_COLUMN})\n• Share with: `{email}`",
+            mention_author=False
+        )
+    except Exception as e:
+        await ctx.reply(f"⚠️ Cannot open sheet: `{e}`\nShare with: `{email}`", mention_author=False)
+
+def _render_status() -> str:
+    st = backfill_state; w = st["welcome"]; p = st["promo"]
+    return (
+        f"Running: **{st['running']}** | Last: {st.get('last_msg','')}\n"
+        f"Welcome — scanned: **{w['scanned']}**, added: **{w['added']}**, updated: **{w['updated']}**, skipped: **{w['skipped']}**\n"
+        f"Promo   — scanned: **{p['scanned']}**, added: **{p['added']}**, updated: **{p['updated']}**, skipped: **{p['skipped']}**"
+    )
+
+@bot.command(name="backfill_tickets")
+@cmd_enabled(ENABLE_CMD_BACKFILL)
+async def cmd_backfill(ctx):
+    if backfill_state["running"]:
+        return await ctx.reply("A backfill is already running. Use !backfill_status.", mention_author=False)
+    backfill_state["running"] = True; backfill_state["last_msg"] = ""
+    progress_msg = await ctx.reply("Starting backfill…", mention_author=False)
+
+    async def progress_loop():
+        while backfill_state["running"]:
+            try: await progress_msg.edit(content=_render_status())
+            except Exception: pass
+            await asyncio.sleep(5.0)
+    updater_task = asyncio.create_task(progress_loop())
+
+    try:
+        async def tick():
+            try: await progress_msg.edit(content=_render_status())
+            except Exception: pass
+
+        if ENABLE_WELCOME_SCAN and WELCOME_CHANNEL_ID:
+            ch = bot.get_channel(WELCOME_CHANNEL_ID)
+            if isinstance(ch, discord.TextChannel):
+                await scan_welcome_channel(ch, progress_cb=tick)
+        if ENABLE_PROMO_SCAN and PROMO_CHANNEL_ID:
+            ch2 = bot.get_channel(PROMO_CHANNEL_ID)
+            if isinstance(ch2, discord.TextChannel):
+                await scan_promo_channel(ch2, progress_cb=tick)
+    finally:
+        backfill_state["running"] = False
+        try: updater_task.cancel()
+        except Exception: pass
+
+    await progress_msg.edit(content=_render_status() + "\nDone.")
+
+    if POST_BACKFILL_SUMMARY:
+        w = backfill_state["welcome"]; p = backfill_state["promo"]
+        def _fmt_list(ids: List[str], max_items=10) -> str:
+            if not ids: return "—"
+            show = ids[:max_items]; extra = len(ids) - len(show)
+            return ", ".join(show) + (f" …(+{extra})" if extra>0 else "")
+        msg = (
+            "**Backfill report (top 10 each)**\n"
+            f"**Welcome** added: {len(w['added_ids'])} — {_fmt_list(w['added_ids'])}\n"
+            f"updated: {len(w['updated_ids'])} — {_fmt_list(w['updated_ids'])}\n"
+            f"skipped: {len(w['skipped_ids'])} — {_fmt_list(w['skipped_ids'])}\n"
+            f"**Promo** added: {len(p['added_ids'])} — {_fmt_list(p['added_ids'])}\n"
+            f"updated: {len(p['updated_ids'])} — {_fmt_list(p['updated_ids'])}\n"
+            f"skipped: {len(p['skipped_ids'])} — {_fmt_list(p['skipped_ids'])}\n"
+        )
+        await ctx.send(msg)
+
+    if AUTO_POST_BACKFILL_DETAILS:
+        data = _build_backfill_details_text()
+        ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+        buf = io.BytesIO(data.encode("utf-8"))
+        await ctx.send(file=discord.File(buf, filename=f"backfill_details_{ts}.txt"))
+
+@bot.command(name="backfill_stop")
+async def cmd_backfill_stop(ctx):
+    if not backfill_state["running"]:
+        return await ctx.reply("No backfill is running.", mention_author=False)
+    backfill_state["running"] = False
+    backfill_state["last_msg"] = "cancel requested"
+    await ctx.reply("Stopping backfill… will halt after the current thread.", mention_author=False)
+
+@bot.command(name="backfill_details")
+async def cmd_backfill_details(ctx: commands.Context):
+    data = _build_backfill_details_text()
+    ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    buf = io.BytesIO(data.encode("utf-8"))
+    await ctx.reply(file=discord.File(buf, filename=f"backfill_details_{ts}.txt"), mention_author=False)
+
+@bot.command(name="clan_tags_debug")
+async def cmd_clan_tags_debug(ctx):
+    tags = _load_clan_tags(force=True)
+    norm_set = { _normalize_dashes(t).upper() for t in tags }
+    has_fit = "F-IT" in norm_set
+    sample = ", ".join(list(tags)[:20]) or "(none)"
+    await ctx.reply(
+        f"Loaded {len(tags)} clan tags from column {CLANLIST_TAG_COLUMN}. Has F-IT: {has_fit}\nSample: {sample}",
+        mention_author=False
+    )
+
+@bot.command(name="dedupe_sheet")
+@cmd_enabled(ENABLE_CMD_DEDUPE)
+async def cmd_dedupe(ctx):
+    try:
+        ws1 = get_ws(SHEET1_NAME, HEADERS_SHEET1)
+        ws4 = get_ws(SHEET4_NAME, HEADERS_SHEET4)
+        kept1, deleted1 = dedupe_sheet(SHEET1_NAME, ws1, has_type=False)
+        kept4, deleted4 = dedupe_sheet(SHEET4_NAME, ws4, has_type=True)
+        await ctx.reply(
+            f"Sheet1: kept **{kept1}** unique tickets, deleted **{deleted1}** dupes.\n"
+            f"Sheet4: kept **{kept4}** unique (ticket+type+created), deleted **{deleted4}** dupes.",
+            mention_author=False
+        )
+    except Exception as e:
+        await ctx.reply(f"Dedup failed: `{e}`", mention_author=False)
+
+@bot.command(name="reload")
+@cmd_enabled(ENABLE_CMD_RELOAD)
+async def cmd_reload(ctx):
+    _ws_cache.clear(); _index_simple.clear(); _index_promo.clear()
+    global _gs_client, _clan_tags_cache, _clan_tags_norm_set, _last_clan_fetch, _tag_regex_cache, _tag_regex_key
+    _gs_client = None; _clan_tags_cache = []; _clan_tags_norm_set = set(); _last_clan_fetch = 0.0; _tag_regex_cache=None; _tag_regex_key=""
+    await ctx.reply("Caches cleared. Reconnect to Sheets on next use.", mention_author=False)
+
+@bot.command(name="health")
+@cmd_enabled(ENABLE_CMD_HEALTH)
+async def cmd_health(ctx):
+    lat = int(bot.latency*1000)
+    try:
+        ws1 = get_ws(SHEET1_NAME, HEADERS_SHEET1)
+        ok = f"🟢 OK ({ws1.title})"
+    except Exception:
+        ok = "🔴 FAILED"
+    await ctx.reply(f"🟢 Bot OK | Latency: {lat} ms | Sheets: {ok} | Uptime: {uptime_str()}", mention_author=False)
+
+@bot.command(name="checksheet")
+@cmd_enabled(ENABLE_CMD_CHECKSHEET)
+async def cmd_checksheet(ctx):
+    try:
+        ws1 = get_ws(SHEET1_NAME, HEADERS_SHEET1)
+        ws4 = get_ws(SHEET4_NAME, HEADERS_SHEET4)
+        await ctx.reply(
+            f"{SHEET1_NAME} rows: {len(ws1.col_values(1))} | {SHEET4_NAME} rows: {len(ws4.col_values(1))}",
+            mention_author=False
+        )
+    except Exception as e:
+        await ctx.reply(f"checksheet failed: `{e}`", mention_author=False)
+
+@bot.command(name="reboot")
+@cmd_enabled(ENABLE_CMD_REBOOT)
+async def cmd_reboot(ctx):
+    await ctx.reply("Rebooting…", mention_author=False)
+    await asyncio.sleep(1.0); os._exit(0)
+
+# ---------- LIVE WATCHERS ----------
+_pending_welcome: Dict[int, Dict[str, Any]] = {}  # thread_id -> {ticket, username, close_dt}
+_pending_promo:   Dict[int, Dict[str, Any]] = {}
+
+def _is_thread_in_parent(thread: discord.Thread, parent_id: int) -> bool:
+    try:
+        return thread and thread.parent_id == parent_id
+    except Exception:
+        return False
+
+async def _rename_welcome_thread_if_needed(thread: discord.Thread, ticket: str, username: str, clantag: str):
+    """Rename to '0000-username-CLAN' if different."""
+    try:
+        desired = f"{_fmt_ticket(ticket)}-{username}-{clantag}".strip("-")
+        if (thread.name or "").strip() != desired:
+            await thread.edit(name=desired)
+    except discord.Forbidden:
+        pass
+    except Exception:
+        pass
+
+async def _finalize_welcome(thread: discord.Thread, ticket: str, username: str, clantag: str, close_dt: Optional[datetime]):
+    ws = get_ws(SHEET1_NAME, HEADERS_SHEET1)
+    await _rename_welcome_thread_if_needed(thread, ticket, username, clantag or "")
+    date_str = fmt_tz(close_dt or await find_close_timestamp(thread) or datetime.utcnow().replace(tzinfo=_tz.utc))
+    row = [_fmt_ticket(ticket), username, clantag or "", date_str]
+    dummy_bucket = _new_bucket()
+    upsert_welcome(SHEET1_NAME, ws, ticket, row, dummy_bucket)
+
+async def _finalize_promo(thread: discord.Thread, ticket: str, username: str, clantag: str, close_dt: Optional[datetime]):
+    ws = get_ws(SHEET4_NAME, HEADERS_SHEET4)
+    typ = await detect_promo_type(thread) or ""
+    created_str = fmt_tz(thread.created_at)
+    date_str = fmt_tz(close_dt or await find_close_timestamp(thread) or datetime.utcnow().replace(tzinfo=_tz.utc))
+    row = [_fmt_ticket(ticket), username, clantag or "", date_str, typ, created_str]
+    dummy_bucket = _new_bucket()
+    upsert_promo(SHEET4_NAME, ws, ticket, typ, created_str, row, dummy_bucket)
+
+def _who_to_ping(msg: discord.Message, thread: discord.Thread) -> Optional[discord.User]:
+    # Prefer an explicitly mentioned user in the "Ticket Closed by" post; fall back to thread.owner
+    if msg.mentions:
+        return msg.mentions[0]
+    try:
+        return thread.owner
+    except Exception:
+        return None
+
+async def _prompt_for_tag(thread: discord.Thread, ticket: str, username: str, msg_to_reply: Optional[discord.Message]):
+    tags = _load_clan_tags(False)
+    sample = ", ".join(list(tags)[:15]) + ("…" if len(tags) > 15 else "")
+    ping_user = _who_to_ping(msg_to_reply, thread)
+    mention = f"{ping_user.mention} " if ping_user else ""
+    txt = (
+        f"{mention}Which clan tag for **{username}**? "
+        f"Reply in this thread with a valid tag (e.g., `C1C9`, `F-IT`).\n"
+        f"_Known tags:_ {sample}"
+    )
+    try:
+        await thread.send(txt, suppress_embeds=True)
+    except Exception:
+        pass
+
+@bot.event
+async def on_message(message: discord.Message):
+    # Don't react to ourselves
+    if message.author.id == getattr(bot.user, "id", None):
+        return
+
+    # Only care about thread messages
+    if not isinstance(message.channel, discord.Thread):
+        return
+
+    thread: discord.Thread = message.channel
+
+    # WELCOME watcher ---------------------------------------------------------
+    if ENABLE_LIVE_WATCH and ENABLE_LIVE_WATCH_WELCOME and _is_thread_in_parent(thread, WELCOME_CHANNEL_ID):
+        text = _aggregate_msg_text(message).lower()
+
+        # 1) "Ticket Closed by" detected -> capture ticket/username, maybe tag, prompt if missing
+        if "ticket closed by" in text:
+            parsed = parse_welcome_thread_name_allow_missing(thread.name or "")
+            if parsed:
+                ticket, username, tag = parsed
+                close_dt = message.created_at
+                if tag:
+                    await _finalize_welcome(thread, ticket, username, tag, close_dt)
+                else:
+                    _pending_welcome[thread.id] = {"ticket": ticket, "username": username, "close_dt": close_dt}
+                    await _prompt_for_tag(thread, ticket, username, message)
+            # continue to allow same message to also contain a tag (rare)
+        # 2) If we’re waiting for a tag, check replies for a known tag
+        elif thread.id in _pending_welcome:
+            if not message.author.bot:
+                tag = _match_tag_in_text(_aggregate_msg_text(message))
+                if tag:
+                    info = _pending_welcome.pop(thread.id, {})
+                    ticket = info.get("ticket"); username = info.get("username"); close_dt = info.get("close_dt")
+                    if ticket and username:
+                        await _finalize_welcome(thread, ticket, username, tag, close_dt)
+                        try:
+                            await thread.send(f"Got it — set clan tag to **{tag}** and logged to the sheet. ✅")
+                        except Exception:
+                            pass
+
+    # PROMO watcher -----------------------------------------------------------
+    if ENABLE_LIVE_WATCH and ENABLE_LIVE_WATCH_PROMO and _is_thread_in_parent(thread, PROMO_CHANNEL_ID):
+        text = _aggregate_msg_text(message).lower()
+
+        if "ticket closed by" in text:
+            parsed = parse_promo_thread_name(thread.name or "")
+            if parsed:
+                ticket, username, tag = parsed
+                close_dt = message.created_at
+                if tag:
+                    await _finalize_promo(thread, ticket, username, tag, close_dt)
+                else:
+                    _pending_promo[thread.id] = {"ticket": ticket, "username": username, "close_dt": close_dt}
+                    await _prompt_for_tag(thread, ticket, username, message)
+        elif thread.id in _pending_promo:
+            if not message.author.bot:
+                tag = _match_tag_in_text(_aggregate_msg_text(message))
+                if tag:
+                    info = _pending_promo.pop(thread.id, {})
+                    ticket = info.get("ticket"); username = info.get("username"); close_dt = info.get("close_dt")
+                    if ticket and username:
+                        await _finalize_promo(thread, ticket, username, tag, close_dt)
+                        try:
+                            await thread.send(f"Got it — set clan tag to **{tag}** and logged to the sheet. ✅")
+                        except Exception:
+                            pass
+
+    # Make sure commands still work
+    await bot.process_commands(message)
+
+# ---------- Ready + health server ----------
+@bot.event
+async def on_ready():
+    print(f"Logged in as {bot.user}", flush=True)
+
+if ENABLE_WEB_SERVER:
+    try:
+        from aiohttp import web
+        async def _health(request): return web.Response(text="ok")
+        async def web_main():
+            app = web.Application()
+            app.router.add_get("/", _health); app.router.add_get("/health", _health)
+            port = int(os.getenv("PORT","10000"))
+            runner = web.AppRunner(app); await runner.setup()
+            site = web.TCPSite(runner,"0.0.0.0",port); await site.start()
+            print(f"Health server on :{port}", flush=True)
+        async def start_all():
+            _print_boot_info()
+            if not TOKEN:
+                print("FATAL: DISCORD_TOKEN/TOKEN not set.", flush=True); raise SystemExit(2)
+            await asyncio.gather(web_main(), bot.start(TOKEN))
+        if __name__ == "__main__":
+            asyncio.run(start_all())
+    except Exception:
+        if __name__ == "__main__":
+            _print_boot_info()
+            if TOKEN: bot.run(TOKEN)
+            else: print("FATAL: DISCORD_TOKEN/TOKEN not set.", flush=True)
+else:
+    if __name__ == "__main__":
+        _print_boot_info()
+        if TOKEN: bot.run(TOKEN)
+        else: print("FATAL: DISCORD_TOKEN/TOKEN not set.", flush=True)
