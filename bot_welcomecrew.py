@@ -159,12 +159,11 @@ def _with_backoff(callable_fn, *a, **k):
                 continue
             raise
 
-# --- HELP CARD (simple, table-style) -----------------------------------------
+# --- HELP CARD (mobile, two-line bullets) ------------------------------------
 from discord import app_commands
 from discord.ext import commands
 import os, discord
 
-# take over !help
 try:
     bot.remove_command("help")
 except Exception:
@@ -173,11 +172,11 @@ except Exception:
 HELP_ICON_URL = os.getenv("HELP_ICON_URL")
 EMBED_COLOR = 0x55CCFF
 
-def _mk_help_embed_simple(guild: discord.Guild | None = None) -> discord.Embed:
+def _mk_help_embed_mobile(guild: discord.Guild | None = None) -> discord.Embed:
     e = discord.Embed(
-        title="C1C-WelcomeCrew — Help",
+        title=" 🌿 C1C-WelcomeCrew — Help",
         color=EMBED_COLOR,
-        description="Tracks Welcome & Promotion/Move threads to Google Sheets and keeps things tidy."
+        description="I help to track Welcome & Promotion/Move threads and keep things tidy."
     )
     if HELP_ICON_URL:
         e.set_thumbnail(url=HELP_ICON_URL)
@@ -186,30 +185,28 @@ def _mk_help_embed_simple(guild: discord.Guild | None = None) -> discord.Embed:
     e.add_field(
         name="User Actions — Recruiters & Mods",
         value=(
-            "• When you close a ticket, I pick up **`Ticket closed by <name>`** and log it.\n"
-            "• If the title misses a clan tag, I prompt in-thread and accept replies like "
-            "**`Tag is F-XX`** or **`C1C9`**.\n"
-            "• I rename the thread to **`####-username-TAG`** and write the record to the stats sheet."
+            "On Close Ticket, I pick up **`Ticket closed by <name>`** and log it.\n"
+            "I’ll prompt in-thread and accept replies like **`C1C9`**.\n"
+            "I rename the thread to **`Closed-####-username-TAG`** and write the record to the stats sheet."
         ),
         inline=False,
     )
 
-    # ——— Commands (table-style via code block) ———
-    commands_table = (
-        "```\n"
-        "!env_check         show required env + hints\n"
-        "!sheetstatus       tabs + service account email\n"
-        "!backfill_tickets  scan threads + upsert (live progress)\n"
-        "!backfill_details  upload diffs/skips as a file\n"
-        "!dedupe_sheet      keep newest (Welcome by ticket; Promo by type+created)\n"
-        "!watch_status      watcher ON/OFF + last actions\n"
-        "!reload            clear sheet cache\n"
-        "!checksheet        sheet row counts\n"
-        "!health            bot & Sheets health\n"
-        "!reboot            soft restart\n"
-        "```"
-    )
-    e.add_field(name="Commands — Admin & Maintenance", value=commands_table, inline=False)
+    # ——— Commands (two-line layout per item) ———
+    commands_pairs = [
+        ("🔹!env_check",        "➖show required env + hints"),
+        ("🔹!sheetstatus",      "➖tabs + service account email"),
+        ("🔹!backfill_tickets", "➖scan threads, show live status"),
+        ("🔹!backfill_details", "➖upload diffs/skips as a file"),
+        ("🔹!dedupe_sheet",     "➖keep newest entry"),
+        ("🔹!watch_status",     "➖watcher ON/OFF + last actions"),
+        ("🔹!reload",           "➖clear sheet cache"),
+        ("🔹!checksheet",       "➖sheet row counts"),
+        ("🔹!health",           "➖bot & Sheets health"),
+        ("🔹!reboot",           "➖soft restart"),
+    ]
+    commands_lines = "\n".join([f"• `{cmd}`\n  → {desc}" for cmd, desc in commands_pairs])
+    e.add_field(name="Commands — Admin & Maintenance", value=commands_lines, inline=False)
 
     # ——— Status ———
     watchers = (
@@ -219,19 +216,19 @@ def _mk_help_embed_simple(guild: discord.Guild | None = None) -> discord.Embed:
     )
     e.add_field(name="Status", value=watchers, inline=False)
 
-    e.set_footer(text="C1C • tidy logs, happy recruiters")
+    e.set_footer(text="C1C 🔹 tidy logs, happy recruiters")
     return e
 
-# Prefix command: !help
+# Prefix: !help
 @bot.command(name="help")
 async def help_cmd(ctx: commands.Context):
-    await ctx.reply(embed=_mk_help_embed_simple(ctx.guild), mention_author=False)
+    await ctx.reply(embed=_mk_help_embed_mobile(ctx.guild), mention_author=False)
 
-# Slash command: /help (ephemeral)
+# Slash: /help (ephemeral)
 @bot.tree.command(name="help", description="Show WelcomeCrew help")
 async def slash_help(interaction: discord.Interaction):
     await interaction.response.send_message(
-        embed=_mk_help_embed_simple(interaction.guild),
+        embed=_mk_help_embed_mobile(interaction.guild),
         ephemeral=True
     )
 # -----------------------------------------------------------------------------
@@ -1287,6 +1284,7 @@ else:
         _print_boot_info()
         if TOKEN: bot.run(TOKEN)
         else: print("FATAL: DISCORD_TOKEN/TOKEN not set.", flush=True)
+
 
 
 
