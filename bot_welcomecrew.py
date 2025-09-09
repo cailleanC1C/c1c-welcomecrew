@@ -1,12 +1,15 @@
-# C1C – WelcomeCrew (v15)
-# - Live watchers for welcome & promo threads:
-#   * Detect "Ticket Closed by", infer/ask for clantag, rename (welcome) and log
-# - Forgiving parsers; F-IT/multi-part tags; clanlist tags from column B (configurable)
-# - Throttled Sheets writes + backoff; live backfill + stop; auto attach details
+# C1C – WelcomeCrew (v16)
+# - Live watchers; notify-channel fallback (no DMs)
+# - Auto-join new threads / on-mention join
+# - Forgiving parsers; F-IT/multi-part tags; clanlist tags from column B
+# - Backfill leaves date blank if not closed; auto details attachment
+# - watch_status with last 5 actions
+# - Throttled/backoff Sheets writes; 4-digit tickets
 
 import os, json, re, asyncio, time, io, random
 from datetime import datetime, timezone as _tz
 from typing import Optional, Tuple, Dict, Any, List
+from collections import deque
 
 import discord
 from discord.ext import commands
@@ -17,10 +20,6 @@ try:
     from zoneinfo import ZoneInfo
 except Exception:
     ZoneInfo = None
-
-from collections import deque  # add this import
-WATCH_LOG = deque(maxlen=50)   # keep a rolling buffer of recent actions
-
 
 # ---------- Flags / Env ----------
 def env_bool(key: str, default: bool=True) -> bool:
@@ -40,7 +39,7 @@ CLANLIST_TAG_COLUMN = int(os.getenv("CLANLIST_TAG_COLUMN", "2"))  # 1-based; def
 
 SHEETS_THROTTLE_MS = int(os.getenv("SHEETS_THROTTLE_MS", "200"))
 
-# Feature toggles (commands)
+# Feature toggles (commands / scans)
 ENABLE_INFER_TAG_FROM_THREAD = env_bool("ENABLE_INFER_TAG_FROM_THREAD", True)
 ENABLE_WELCOME_SCAN        = env_bool("ENABLE_WELCOME_SCAN", True)
 ENABLE_PROMO_SCAN          = env_bool("ENABLE_PROMO_SCAN", True)
@@ -64,6 +63,16 @@ ENABLE_LIVE_WATCH_PROMO    = env_bool("ENABLE_LIVE_WATCH_PROMO", True)
 AUTO_POST_BACKFILL_DETAILS = env_bool("AUTO_POST_BACKFILL_DETAILS", True)
 POST_BACKFILL_SUMMARY      = env_bool("POST_BACKFILL_SUMMARY", False)
 
+# Private-thread fallback (NO DMs)
+ENABLE_NOTIFY_FALLBACK    = env_bool("ENABLE_NOTIFY_FALLBACK", True)
+NOTIFY_CHANNEL_ID         = int(os.getenv("NOTIFY_CHANNEL_ID", "0"))    # e.g., coordinators channel
+NOTIFY_PING_ROLE_ID       = int(os.getenv("NOTIFY_PING_ROLE_ID", "0"))  # optional role to ping
+ALLOW_SELF_JOIN_PRIVATE   = env_bool("ALLOW_SELF_JOIN_PRIVATE", True)
+
+# Require close marker? (you asked to leave date blank instead, so defaults OFF)
+REQUIRE_CLOSE_MARKER_WELCOME = env_bool("REQUIRE_CLOSE_MARKER_WELCOME", False)
+REQUIRE_CLOSE_MARKER_PROMO   = env_bool("REQUIRE_CLOSE_MARKER_PROMO", False)
+
 # ---------- Discord ----------
 intents = discord.Intents.default()
 intents.message_content = True
@@ -84,7 +93,7 @@ def fmt_tz(dt: datetime) -> str:
     return (dt or datetime.utcnow().replace(tzinfo=_tz.utc)).strftime("%Y-%m-%d %H:%M")
 
 def _print_boot_info():
-    print("=== WelcomeCrew v15 boot ===", flush=True)
+    print("=== WelcomeCrew v16 boot ===", flush=True)
     print(f"Sheets: {SHEET1_NAME} / {SHEET4_NAME} / clanlist:{CLANLIST_TAB_NAME} (tags col={CLANLIST_TAG_COLUMN})", flush=True)
     print(f"Welcome={WELCOME_CHANNEL_ID} Promo={PROMO_CHANNEL_ID}", flush=True)
     print(f"TZ={TIMEZONE} | infer-from-thread={ENABLE_INFER_TAG_FROM_THREAD}", flush=True)
@@ -133,7 +142,7 @@ def get_ws(name: str, want_headers: List[str]):
     _ws_cache[name] = ws
     return ws
 
-# ---------- Rate limit helpers ----------
+# ---------- Rate-limit helpers ----------
 def _sleep_ms(ms:int):
     if ms > 0:
         time.sleep(ms/1000.0)
@@ -150,61 +159,21 @@ def _with_backoff(callable_fn, *a, **k):
                 continue
             raise
 
-def thread_link(thread: discord.Thread) -> str:
-    gid = getattr(thread.guild, "id", 0)
-    return f"https://discord.com/channels/{gid}/{thread.id}"
-
-def log_action(scope: str, action: str, **data):
-    """
-    scope: 'welcome' | 'promo'
-    action: 'close_detected' | 'prompt_sent' | 'tag_received' | 'renamed' | 'logged'
-    data: ticket, username, clantag, status, link, etc.
-    """
-    ts = datetime.utcnow().replace(tzinfo=_tz.utc)
-    WATCH_LOG.appendleft({"ts": ts, "scope": scope, "action": action, "data": data})
-
-def render_watch_status_text() -> str:
-    on = "ON" if ENABLE_LIVE_WATCH else "OFF"
-    on_w = "ON" if ENABLE_LIVE_WATCH_WELCOME else "OFF"
-    on_p = "ON" if ENABLE_LIVE_WATCH_PROMO else "OFF"
-    lines = [f"👀 **Watchers**: {on} (welcome={on_w}, promo={on_p})"]
-    if WATCH_LOG:
-        lines.append("**Recent (latest 5):**")
-        for item in list(WATCH_LOG)[:5]:
-            ts = fmt_tz(item["ts"])
-            scope = item["scope"]; act = item["action"]
-            d = item["data"]
-            ticket   = d.get("ticket","")
-            username = d.get("username","")
-            clantag  = d.get("clantag","")
-            status   = d.get("status","")
-            link     = d.get("link","")
-            bits = [b for b in [ticket, username, clantag, status] if b]
-            summary = " | ".join(bits) if bits else ""
-            line = f"• [{ts}] {scope} · {act}"
-            if summary: line += f" · {summary}"
-            if link:    line += f" · <{link}>"
-            lines.append(line)
-    else:
-        lines.append("_No recent actions yet._")
-    return "\n".join(lines)
-
-
 # ---------- Clanlist & tag matching ----------
 _clan_tags_cache: List[str] = []
 _clan_tags_norm_set: set = set()
 _last_clan_fetch = 0.0
 _tag_regex_cache = None
-_tag_regex_key = ""
 
 def _normalize_dashes(s: str) -> str:
+    # en/em/figure hyphens -> ASCII '-'
     return re.sub(r"[\u2010\u2011\u2012\u2013\u2014\u2015]", "-", s or "")
 
 def _fmt_ticket(s: str) -> str:
     return (s or "").strip().lstrip("#").zfill(4)
 
 def _load_clan_tags(force: bool=False) -> List[str]:
-    global _clan_tags_cache, _clan_tags_norm_set, _last_clan_fetch, _tag_regex_cache, _tag_regex_key
+    global _clan_tags_cache, _clan_tags_norm_set, _last_clan_fetch, _tag_regex_cache
     now = time.time()
     if not force and _clan_tags_cache and (now - _last_clan_fetch < 300):
         return _clan_tags_cache
@@ -237,13 +206,11 @@ def _load_clan_tags(force: bool=False) -> List[str]:
         if parts:
             alt = "|".join(re.escape(p) for p in parts)
             _tag_regex_cache = re.compile(rf"(?<![A-Za-z0-9_])(?:{alt})(?![A-Za-z0-9_])", re.IGNORECASE)
-            _tag_regex_key = "|".join(parts)
         else:
             _tag_regex_cache = None
-            _tag_regex_key = ""
     except Exception as e:
         print("Failed to load clanlist:", e, flush=True)
-        _clan_tags_cache = []; _clan_tags_norm_set = set(); _tag_regex_cache = None; _tag_regex_key = ""
+        _clan_tags_cache = []; _clan_tags_norm_set = set(); _tag_regex_cache = None
     return _clan_tags_cache
 
 def _match_tag_in_text(text: str) -> Optional[str]:
@@ -255,13 +222,17 @@ def _match_tag_in_text(text: str) -> Optional[str]:
     return m.group(0).upper() if m else None
 
 def _pick_tag_by_suffix(remainder: str, known_tags: List[str]) -> Optional[Tuple[str, str]]:
+    """
+    Try to find a '-TAG' suffix where TAG is in known_tags.
+    Supports multi-segment tags like 'F-IT'. Checks last 1..3 segments.
+    """
     s = _normalize_dashes(remainder).strip()
     parts = [p for p in s.split("-") if p != ""]
     if not parts:
         return None
     norm_tags = _clan_tags_norm_set or { _normalize_dashes(t).upper() for t in known_tags }
-    max_k = min(3, len(parts))
-    for k in range(max_k, 0, -1):
+    max_k = min(3, len(parts))  # allow up to 3-part tags
+    for k in range(max_k, 0, -1):  # longest suffix first
         cand = "-".join(parts[-k:]).upper()
         if cand in norm_tags:
             username = "-".join(parts[:-k])
@@ -535,14 +506,161 @@ async def find_close_timestamp(thread: discord.Thread) -> Optional[datetime]:
     except Exception: pass
     return None
 
-# ---------- Scans (live progress + cancel-safe) ----------
+# ---------- Watch status log ----------
+WATCH_LOG = deque(maxlen=50)
+
+def thread_link(thread: discord.Thread) -> str:
+    gid = getattr(thread.guild, "id", 0)
+    return f"https://discord.com/channels/{gid}/{thread.id}"
+
+def log_action(scope: str, action: str, **data):
+    ts = datetime.utcnow().replace(tzinfo=_tz.utc)
+    WATCH_LOG.appendleft({"ts": ts, "scope": scope, "action": action, "data": data})
+
+def render_watch_status_text() -> str:
+    on = "ON" if ENABLE_LIVE_WATCH else "OFF"
+    on_w = "ON" if ENABLE_LIVE_WATCH_WELCOME else "OFF"
+    on_p = "ON" if ENABLE_LIVE_WATCH_PROMO else "OFF"
+    lines = [f"👀 **Watchers**: {on} (welcome={on_w}, promo={on_p})"]
+    if WATCH_LOG:
+        lines.append("**Recent (latest 5):**")
+        for item in list(WATCH_LOG)[:5]:
+            ts = fmt_tz(item["ts"])
+            scope = item["scope"]; act = item["action"]
+            d = item["data"]
+            ticket   = d.get("ticket","")
+            username = d.get("username","")
+            clantag  = d.get("clantag","")
+            status   = d.get("status","")
+            link     = d.get("link","")
+            bits = [b for b in [ticket, username, clantag, status] if b]
+            summary = " | ".join(bits) if bits else ""
+            line = f"• [{ts}] {scope} · {act}"
+            if summary: line += f" · {summary}"
+            if link:    line += f" · <{link}>"
+            lines.append(line)
+    else:
+        lines.append("_No recent actions yet._")
+    return "\n".join(lines)
+
+# ---------- Fallback notify helpers ----------
+def _notify_prefix(guild: discord.Guild, closer: Optional[discord.User]) -> str:
+    parts = []
+    if NOTIFY_PING_ROLE_ID:
+        r = guild.get_role(NOTIFY_PING_ROLE_ID)
+        if r: parts.append(r.mention)
+    if closer:
+        parts.append(closer.mention)
+    return (" ".join(parts) + " ") if parts else ""
+
+async def _notify_channel(guild: discord.Guild, content: str):
+    if not ENABLE_NOTIFY_FALLBACK or not NOTIFY_CHANNEL_ID:
+        return False
+    ch = guild.get_channel(NOTIFY_CHANNEL_ID)
+    if not isinstance(ch, (discord.TextChannel, discord.Thread)):
+        return False
+    try:
+        await ch.send(content)
+        return True
+    except Exception:
+        return False
+
+async def _try_join_private_thread(thread: discord.Thread) -> bool:
+    try:
+        await thread.join(); return True
+    except Exception:
+        pass
+    if not ALLOW_SELF_JOIN_PRIVATE:
+        return False
+    try:
+        me = thread.guild.me
+        if me:
+            await thread.add_user(me)
+            return True
+    except Exception:
+        pass
+    return False
+
+def _who_to_ping(msg: discord.Message, thread: discord.Thread) -> Optional[discord.User]:
+    if msg and msg.mentions:
+        return msg.mentions[0]
+    try:
+        return thread.owner
+    except Exception:
+        return None
+
+async def _prompt_for_tag(thread: discord.Thread, ticket: str, username: str, msg_to_reply: Optional[discord.Message]):
+    tags = _load_clan_tags(False)
+    sample = ", ".join(list(tags)[:15]) + ("…" if len(tags) > 15 else "")
+    closer = _who_to_ping(msg_to_reply, thread)
+    mention = f"{closer.mention} " if closer else ""
+    text = (
+        f"{mention}Which clan tag for **{username}** (ticket **{_fmt_ticket(ticket)}**)? "
+        f"Reply here with a valid tag (e.g., `C1C9`, `F-IT`).\n"
+        f"_Known tags:_ {sample}"
+    )
+    # try in thread
+    try:
+        await thread.send(text, suppress_embeds=True)
+        return
+    except discord.Forbidden:
+        if await _try_join_private_thread(thread):
+            try:
+                await thread.send(text, suppress_embeds=True)
+                return
+            except Exception:
+                pass
+    except Exception:
+        pass
+    # fallback: notify channel
+    prefix = _notify_prefix(thread.guild, closer)
+    await _notify_channel(
+        thread.guild,
+        f"{prefix}Need clan tag for **{username}** (ticket **{_fmt_ticket(ticket)}**) → {thread_link(thread)}"
+    )
+
+# ---------- Finalizers (log + optional rename) ----------
+async def _rename_welcome_thread_if_needed(thread: discord.Thread, ticket: str, username: str, clantag: str) -> bool:
+    try:
+        desired = f"{_fmt_ticket(ticket)}-{username}-{clantag}".strip("-")
+        if (thread.name or "").strip() != desired and clantag:
+            await thread.edit(name=desired)
+            return True
+    except discord.Forbidden:
+        pass
+    except Exception:
+        pass
+    return False
+
+async def _finalize_welcome(thread: discord.Thread, ticket: str, username: str, clantag: str, close_dt: Optional[datetime]):
+    ws = get_ws(SHEET1_NAME, HEADERS_SHEET1)
+    renamed = await _rename_welcome_thread_if_needed(thread, ticket, username, clantag or "")
+    if renamed:
+        log_action("welcome", "renamed", ticket=_fmt_ticket(ticket), username=username, clantag=clantag or "", link=thread_link(thread))
+    # leave date blank if not closed
+    date_str = fmt_tz(close_dt) if close_dt else ""
+    row = [_fmt_ticket(ticket), username, clantag or "", date_str]
+    dummy_bucket = _new_bucket()
+    status = upsert_welcome(SHEET1_NAME, ws, ticket, row, dummy_bucket)
+    log_action("welcome", "logged", ticket=_fmt_ticket(ticket), username=username, clantag=clantag or "", status=status, link=thread_link(thread))
+
+async def _finalize_promo(thread: discord.Thread, ticket: str, username: str, clantag: str, close_dt: Optional[datetime]):
+    ws = get_ws(SHEET4_NAME, HEADERS_SHEET4)
+    typ = await detect_promo_type(thread) or ""
+    created_str = fmt_tz(thread.created_at)
+    date_str = fmt_tz(close_dt) if close_dt else ""
+    row = [_fmt_ticket(ticket), username, clantag or "", date_str, typ, created_str]
+    dummy_bucket = _new_bucket()
+    status = upsert_promo(SHEET4_NAME, ws, ticket, typ, created_str, row, dummy_bucket)
+    log_action("promo", "logged", ticket=_fmt_ticket(ticket), username=username, clantag=clantag or "", status=status, link=thread_link(thread))
+
+# ---------- Scans (backfill) ----------
 def _new_report_bucket(): return _new_bucket()
 
 async def scan_welcome_channel(channel: discord.TextChannel, progress_cb=None):
     st = backfill_state["welcome"] = _new_report_bucket()
     if not ENABLE_WELCOME_SCAN:
         backfill_state["last_msg"] = "welcome scan disabled"; return
-
     ws = get_ws(SHEET1_NAME, HEADERS_SHEET1)
     ws_index_welcome(SHEET1_NAME, ws)
 
@@ -556,7 +674,6 @@ async def scan_welcome_channel(channel: discord.TextChannel, progress_cb=None):
             if not backfill_state["running"]: break
             await handle(th)
     except Exception: pass
-
     try:
         async for th in channel.archived_threads(limit=None, private=False):
             if not backfill_state["running"]: break
@@ -582,8 +699,12 @@ async def _handle_welcome_thread(th: discord.Thread, ws, st):
     if not clantag:
         inferred = await infer_clantag_from_thread(th)
         clantag = inferred or ""
+    # date closed: blank if not found or if strict env requires marker and it's missing
     dt = await find_close_timestamp(th)
-    date_str = fmt_tz(dt or datetime.utcnow().replace(tzinfo=_tz.utc))
+    if REQUIRE_CLOSE_MARKER_WELCOME and not dt:
+        date_str = ""
+    else:
+        date_str = fmt_tz(dt) if dt else ""
     row = [ticket, username, clantag, date_str]
     status = upsert_welcome(SHEET1_NAME, ws, ticket, row, st)
     if status == "inserted":
@@ -597,7 +718,6 @@ async def scan_promo_channel(channel: discord.TextChannel, progress_cb=None):
     st = backfill_state["promo"] = _new_report_bucket()
     if not ENABLE_PROMO_SCAN:
         backfill_state["last_msg"] = "promo scan disabled"; return
-
     ws = get_ws(SHEET4_NAME, HEADERS_SHEET4)
     ws_index_promo(SHEET4_NAME, ws)
 
@@ -611,7 +731,6 @@ async def scan_promo_channel(channel: discord.TextChannel, progress_cb=None):
             if not backfill_state["running"]: break
             await handle(th)
     except Exception: pass
-
     try:
         async for th in channel.archived_threads(limit=None, private=False):
             if not backfill_state["running"]: break
@@ -636,9 +755,11 @@ async def _handle_promo_thread(th: discord.Thread, ws, st):
     ticket, username, clantag = parsed
     typ = await detect_promo_type(th) or ""
     dt_close = await find_close_timestamp(th)
-    date_str = fmt_tz(dt_close or datetime.utcnow().replace(tzinfo=_tz.utc))
+    if REQUIRE_CLOSE_MARKER_PROMO and not dt_close:
+        date_str = ""
+    else:
+        date_str = fmt_tz(dt_close) if dt_close else ""
     created_str = fmt_tz(th.created_at)
-
     row = [ticket, username, clantag, date_str, typ, created_str]
     status = upsert_promo(SHEET4_NAME, ws, ticket, typ, created_str, row, st)
     key = f"{ticket}:{typ or 'unknown'}:{created_str}"
@@ -679,21 +800,6 @@ def _build_backfill_details_text() -> str:
     lines += section("PROMO — UPDATED (with diffs):", p["updated_details"])
     lines += section("PROMO — SKIPPED (id -> reason):", [f"{k} -> {v}" for k,v in p["skipped_reasons"].items()])
     return "\n".join(lines) or "(empty)"
-
-# ---------- Thread rename helper ----------
-async def _rename_welcome_thread_if_needed(thread: discord.Thread, ticket: str, username: str, clantag: str) -> bool:
-    """Rename to '0000-username-CLAN' if different. Returns True if renamed."""
-    try:
-        desired = f"{_fmt_ticket(ticket)}-{username}-{clantag}".strip("-")
-        if (thread.name or "").strip() != desired:
-            await thread.edit(name=desired)
-            return True
-    except discord.Forbidden:
-        pass
-    except Exception:
-        pass
-    return False
-
 
 # ---------- Commands ----------
 def cmd_enabled(flag: bool):
@@ -789,10 +895,6 @@ async def cmd_backfill(ctx):
         ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
         buf = io.BytesIO(data.encode("utf-8"))
         await ctx.send(file=discord.File(buf, filename=f"backfill_details_{ts}.txt"))
-                            
-@bot.command(name="watch_status")
-async def cmd_watch_status(ctx):
-    await ctx.reply(render_watch_status_text(), mention_author=False)
 
 @bot.command(name="backfill_stop")
 async def cmd_backfill_stop(ctx):
@@ -840,8 +942,8 @@ async def cmd_dedupe(ctx):
 @cmd_enabled(ENABLE_CMD_RELOAD)
 async def cmd_reload(ctx):
     _ws_cache.clear(); _index_simple.clear(); _index_promo.clear()
-    global _gs_client, _clan_tags_cache, _clan_tags_norm_set, _last_clan_fetch, _tag_regex_cache, _tag_regex_key
-    _gs_client = None; _clan_tags_cache = []; _clan_tags_norm_set = set(); _last_clan_fetch = 0.0; _tag_regex_cache=None; _tag_regex_key=""
+    global _gs_client, _clan_tags_cache, _clan_tags_norm_set, _last_clan_fetch, _tag_regex_cache
+    _gs_client = None; _clan_tags_cache = []; _clan_tags_norm_set = set(); _last_clan_fetch = 0.0; _tag_regex_cache=None
     await ctx.reply("Caches cleared. Reconnect to Sheets on next use.", mention_author=False)
 
 @bot.command(name="health")
@@ -874,6 +976,10 @@ async def cmd_reboot(ctx):
     await ctx.reply("Rebooting…", mention_author=False)
     await asyncio.sleep(1.0); os._exit(0)
 
+@bot.command(name="watch_status")
+async def cmd_watch_status(ctx):
+    await ctx.reply(render_watch_status_text(), mention_author=False)
+
 # ---------- LIVE WATCHERS ----------
 _pending_welcome: Dict[int, Dict[str, Any]] = {}  # thread_id -> {ticket, username, close_dt}
 _pending_promo:   Dict[int, Dict[str, Any]] = {}
@@ -884,157 +990,86 @@ def _is_thread_in_parent(thread: discord.Thread, parent_id: int) -> bool:
     except Exception:
         return False
 
-async def _rename_welcome_thread_if_needed(thread: discord.Thread, ticket: str, username: str, clantag: str):
-    """Rename to '0000-username-CLAN' if different."""
-    try:
-        desired = f"{_fmt_ticket(ticket)}-{username}-{clantag}".strip("-")
-        if (thread.name or "").strip() != desired:
-            await thread.edit(name=desired)
-    except discord.Forbidden:
-        pass
-    except Exception:
-        pass
-
-async def _finalize_welcome(thread: discord.Thread, ticket: str, username: str, clantag: str, close_dt: Optional[datetime]):
-    ws = get_ws(SHEET1_NAME, HEADERS_SHEET1)
-    renamed = await _rename_welcome_thread_if_needed(thread, ticket, username, clantag or "")
-    if renamed:
-        log_action("welcome", "renamed", ticket=_fmt_ticket(ticket), username=username, clantag=clantag or "", link=thread_link(thread))
-    date_str = fmt_tz(close_dt or await find_close_timestamp(thread) or datetime.utcnow().replace(tzinfo=_tz.utc))
-    row = [_fmt_ticket(ticket), username, clantag or "", date_str]
-    dummy_bucket = _new_bucket()
-    status = upsert_welcome(SHEET1_NAME, ws, ticket, row, dummy_bucket)
-    log_action("welcome", "logged", ticket=_fmt_ticket(ticket), username=username, clantag=clantag or "", status=status, link=thread_link(thread))
-
-async def _finalize_promo(thread: discord.Thread, ticket: str, username: str, clantag: str, close_dt: Optional[datetime]):
-    ws = get_ws(SHEET4_NAME, HEADERS_SHEET4)
-    typ = await detect_promo_type(thread) or ""
-    created_str = fmt_tz(thread.created_at)
-    date_str = fmt_tz(close_dt or await find_close_timestamp(thread) or datetime.utcnow().replace(tzinfo=_tz.utc))
-    row = [_fmt_ticket(ticket), username, clantag or "", date_str, typ, created_str]
-    dummy_bucket = _new_bucket()
-    status = upsert_promo(SHEET4_NAME, ws, ticket, typ, created_str, row, dummy_bucket)
-    log_action("promo", "logged", ticket=_fmt_ticket(ticket), username=username, clantag=clantag or "", status=status, link=thread_link(thread))
-
-def _who_to_ping(msg: discord.Message, thread: discord.Thread) -> Optional[discord.User]:
-    # Prefer an explicitly mentioned user in the "Ticket Closed by" post; fall back to thread.owner
-    if msg.mentions:
-        return msg.mentions[0]
-    try:
-        return thread.owner
-    except Exception:
-        return None
-
-async def _prompt_for_tag(thread: discord.Thread, ticket: str, username: str, msg_to_reply: Optional[discord.Message]):
-    tags = _load_clan_tags(False)
-    sample = ", ".join(list(tags)[:15]) + ("…" if len(tags) > 15 else "")
-    ping_user = _who_to_ping(msg_to_reply, thread)
-    mention = f"{ping_user.mention} " if ping_user else ""
-    txt = (
-        f"{mention}Which clan tag for **{username}**? "
-        f"Reply in this thread with a valid tag (e.g., `C1C9`, `F-IT`).\n"
-        f"_Known tags:_ {sample}"
-    )
-    try:
-        await thread.send(txt, suppress_embeds=True)
-    except Exception:
-        pass
-
-@bot.event
-async def on_message(message: discord.Message):
-    # Don't react to ourselves
-    if message.author.id == getattr(bot.user, "id", None):
-        return
-
-    # Only care about thread messages
-    if not isinstance(message.channel, discord.Thread):
-        return
-
-    thread: discord.Thread = message.channel
-
-    # WELCOME watcher ---------------------------------------------------------
-    if ENABLE_LIVE_WATCH and ENABLE_LIVE_WATCH_WELCOME and _is_thread_in_parent(thread, WELCOME_CHANNEL_ID):
-        text = _aggregate_msg_text(message).lower()
-
-        # 1) "Ticket Closed by" detected -> capture ticket/username, maybe tag, prompt if missing
-        if "ticket closed by" in text:
-            parsed = parse_welcome_thread_name_allow_missing(thread.name or "")
-            if parsed:
-                ticket, username, tag = parsed
-                close_dt = message.created_at
-                log_action("welcome", "close_detected", ticket=_fmt_ticket(ticket), username=username, clantag=tag or "", link=thread_link(thread))
-                if tag:
-                    await _finalize_welcome(thread, ticket, username, tag, close_dt)
-                else:
-                    _pending_welcome[thread.id] = {"ticket": ticket, "username": username, "close_dt": close_dt}
-                    await _prompt_for_tag(thread, ticket, username, message)
-                    log_action("welcome", "prompt_sent", ticket=_fmt_ticket(ticket), username=username, link=thread_link(thread))
-        # 2) If we’re waiting for a tag, check replies for a known tag
-        elif thread.id in _pending_promo:
-            if not message.author.bot:
-                tag = _match_tag_in_text(_aggregate_msg_text(message))
-                if tag:
-                    info = _pending_promo.pop(thread.id, {})
-                    ticket = info.get("ticket"); username = info.get("username"); close_dt = info.get("close_dt")
-                    if ticket and username:
-                        log_action("promo", "tag_received", ticket=_fmt_ticket(ticket), clantag=tag, link=thread_link(thread))
-                        await _finalize_promo(thread, ticket, username, tag, close_dt)
-                        try:
-                            await thread.send(f"Got it — set clan tag to **{tag}** and logged to the sheet. ✅")
-                        except Exception:
-                            pass
-
-
-    # PROMO watcher -----------------------------------------------------------
-    if ENABLE_LIVE_WATCH and ENABLE_LIVE_WATCH_PROMO and _is_thread_in_parent(thread, PROMO_CHANNEL_ID):
-        text = _aggregate_msg_text(message).lower()
-
-        if "ticket closed by" in text:
-            parsed = parse_promo_thread_name(thread.name or "")
-            if parsed:
-                ticket, username, tag = parsed
-                close_dt = message.created_at
-                if tag:
-                    await _finalize_promo(thread, ticket, username, tag, close_dt)
-                else:
-                    _pending_promo[thread.id] = {"ticket": ticket, "username": username, "close_dt": close_dt}
-                    await _prompt_for_tag(thread, ticket, username, message)
-        elif thread.id in _pending_promo:
-            if not message.author.bot:
-                tag = _match_tag_in_text(_aggregate_msg_text(message))
-                if tag:
-                    info = _pending_promo.pop(thread.id, {})
-                    ticket = info.get("ticket"); username = info.get("username"); close_dt = info.get("close_dt")
-                    if ticket and username:
-                        await _finalize_promo(thread, ticket, username, tag, close_dt)
-                        try:
-                            await thread.send(f"Got it — set clan tag to **{tag}** and logged to the sheet. ✅")
-                        except Exception:
-                            pass
-
-    # Make sure commands still work
-    await bot.process_commands(message)
-
-# Auto-join new threads in our target channels (even if not pinged)
 @bot.event
 async def on_thread_create(thread: discord.Thread):
+    # Auto-join new threads in our target channels (even if not pinged)
     try:
         if thread.parent_id in {WELCOME_CHANNEL_ID, PROMO_CHANNEL_ID}:
-            await thread.join()  # works for public + (perms allowing) private
+            await thread.join()
     except Exception:
         pass
 
-# If we ever get mentioned in a thread, join it so we can speak
 @bot.event
 async def on_message(message: discord.Message):
+    # Only handle thread messages for watchers (commands still processed at end)
     if isinstance(message.channel, discord.Thread):
         th = message.channel
+        # If mentioned, join to ensure we can speak
         if th.parent_id in {WELCOME_CHANNEL_ID, PROMO_CHANNEL_ID}:
             if bot.user and bot.user.mentioned_in(message):
                 try: await th.join()
                 except Exception: pass
-    await bot.process_commands(message)
 
+        # WELCOME watcher
+        if ENABLE_LIVE_WATCH and ENABLE_LIVE_WATCH_WELCOME and _is_thread_in_parent(th, WELCOME_CHANNEL_ID):
+            text = _aggregate_msg_text(message).lower()
+            if "ticket closed by" in text:
+                parsed = parse_welcome_thread_name_allow_missing(th.name or "")
+                if parsed:
+                    ticket, username, tag = parsed
+                    close_dt = message.created_at
+                    log_action("welcome", "close_detected", ticket=_fmt_ticket(ticket), username=username, clantag=tag or "", link=thread_link(th))
+                    if tag:
+                        await _finalize_welcome(th, ticket, username, tag, close_dt)
+                    else:
+                        _pending_welcome[th.id] = {"ticket": ticket, "username": username, "close_dt": close_dt}
+                        await _prompt_for_tag(th, ticket, username, message)
+                        log_action("welcome", "prompt_sent", ticket=_fmt_ticket(ticket), username=username, link=thread_link(th))
+            elif th.id in _pending_welcome:
+                if not message.author.bot:
+                    tag = _match_tag_in_text(_aggregate_msg_text(message))
+                    if tag:
+                        info = _pending_welcome.pop(th.id, {})
+                        ticket = info.get("ticket"); username = info.get("username"); close_dt = info.get("close_dt")
+                        if ticket and username:
+                            log_action("welcome", "tag_received", ticket=_fmt_ticket(ticket), clantag=tag, link=thread_link(th))
+                            await _finalize_welcome(th, ticket, username, tag, close_dt)
+                            try:
+                                await th.send(f"Got it — set clan tag to **{tag}** and logged to the sheet. ✅")
+                            except Exception:
+                                pass
+
+        # PROMO watcher
+        if ENABLE_LIVE_WATCH and ENABLE_LIVE_WATCH_PROMO and _is_thread_in_parent(th, PROMO_CHANNEL_ID):
+            text = _aggregate_msg_text(message).lower()
+            if "ticket closed by" in text:
+                parsed = parse_promo_thread_name(th.name or "")
+                if parsed:
+                    ticket, username, tag = parsed
+                    close_dt = message.created_at
+                    log_action("promo", "close_detected", ticket=_fmt_ticket(ticket), username=username, clantag=tag or "", link=thread_link(th))
+                    if tag:
+                        await _finalize_promo(th, ticket, username, tag, close_dt)
+                    else:
+                        _pending_promo[th.id] = {"ticket": ticket, "username": username, "close_dt": close_dt}
+                        await _prompt_for_tag(th, ticket, username, message)
+                        log_action("promo", "prompt_sent", ticket=_fmt_ticket(ticket), username=username, link=thread_link(th))
+            elif th.id in _pending_promo:
+                if not message.author.bot:
+                    tag = _match_tag_in_text(_aggregate_msg_text(message))
+                    if tag:
+                        info = _pending_promo.pop(th.id, {})
+                        ticket = info.get("ticket"); username = info.get("username"); close_dt = info.get("close_dt")
+                        if ticket and username:
+                            log_action("promo", "tag_received", ticket=_fmt_ticket(ticket), clantag=tag, link=thread_link(th))
+                            await _finalize_promo(th, ticket, username, tag, close_dt)
+                            try:
+                                await th.send(f"Got it — set clan tag to **{tag}** and logged to the sheet. ✅")
+                            except Exception:
+                                pass
+
+    # Always let commands run
+    await bot.process_commands(message)
 
 # ---------- Ready + health server ----------
 @bot.event
@@ -1069,5 +1104,3 @@ else:
         _print_boot_info()
         if TOKEN: bot.run(TOKEN)
         else: print("FATAL: DISCORD_TOKEN/TOKEN not set.", flush=True)
-
-
