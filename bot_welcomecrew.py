@@ -159,6 +159,83 @@ def _with_backoff(callable_fn, *a, **k):
                 continue
             raise
 
+# --- HELP CARD (drop-in) ------------------------------------------------------
+import os
+import discord
+from discord import app_commands
+from discord.ext import commands
+
+# If the default help is still registered, remove it so we can own !help
+try:
+    bot.remove_command("help")
+except Exception:
+    pass
+
+HELP_ICON_URL = os.getenv("HELP_ICON_URL")  # e.g., https://i.imgur.com/yourC1Cicon.png
+
+def _mk_help_embed(guild: discord.Guild | None = None) -> discord.Embed:
+    e = discord.Embed(
+        title="C1C-WelcomeCrew — Help",
+        description=(
+            "Logs **Welcome** & **Promotion/Move** threads into Google Sheets, prompts for missing clan tags, "
+            "and gives you backfill/dedupe tools. Built for recruiters & mods.\n"
+        ),
+        color=0x55CCFF,
+    )
+    if HELP_ICON_URL:
+        e.set_thumbnail(url=HELP_ICON_URL)
+
+    e.add_field(
+        name="For Recruiters & Mods",
+        value=(
+            "• Close a Welcome thread with a note like **`Ticket closed by <name>`** → it logs to the sheet.\n"
+            "• If the thread title misses a tag, reply in-thread with **`Tag is F-XX`** (or similar) and I’ll pick it up.\n"
+            "• Promo/Move threads get auto-typed (returning, move request, etc.).\n"
+        ),
+        inline=False,
+    )
+
+    e.add_field(
+        name="Admin / Maintenance",
+        value=(
+            "• **`!env_check`** — Show required env (IDs, sheet, timezone) and what’s missing.\n"
+            "• **`!sheetstatus`** — Check tabs + show the service account email to share the sheet with.\n"
+            "• **`!backfill_tickets`** — Scan active/archived threads and upsert rows with a live progress message.\n"
+            "• **`!backfill_details`** — Upload a text file of diffs/skips after backfill.\n"
+            "• **`!dedupe_sheet`** — Keep newest per key (Welcome by ticket; Promo by ticket+type+created).\n"
+            "• **`!watch_status`** — Show watcher ON/OFF and last actions.\n"
+            "• **`!reload`** — Clear the sheet cache (fresh read next run).\n"
+            "• **`!checksheet`** / **`!health`** — Quick sheet sanity / bot & Sheets health.\n"
+            "• **`!reboot`** — Soft restart (Render will bring me back).\n"
+        ),
+        inline=False,
+    )
+
+    e.add_field(
+        name="Notes",
+        value=(
+            "• Channels: set **WELCOME_CHANNEL_ID** and **PROMO_CHANNEL_ID**. For private-thread prompts, you can set "
+            "**NOTIFY_CHANNEL_ID** and **NOTIFY_PING_ROLE_ID** as a fallback.\n"
+            "• Clan tags source: sheet tab **`clanlist`** (default **column B**). Override with **CLANLIST_TAG_COLUMN** if needed.\n"
+            "• Dates are formatted in **TIMEZONE** (default UTC).\n"
+        ),
+        inline=False,
+    )
+
+    e.set_footer(text="C1C • tidy logs, happy recruiters")
+    return e
+
+# Prefix command: !help
+@bot.command(name="help")
+async def help_cmd(ctx: commands.Context):
+    await ctx.reply(embed=_mk_help_embed(ctx.guild), mention_author=False)
+
+# Slash command: /help (ephemeral)
+@bot.tree.command(name="help", description="Show WelcomeCrew help")
+async def slash_help(interaction: discord.Interaction):
+    await interaction.response.send_message(embed=_mk_help_embed(interaction.guild), ephemeral=True)
+# -----------------------------------------------------------------------------
+
 # ---------- Clanlist & tag matching ----------
 _clan_tags_cache: List[str] = []
 _clan_tags_norm_set: set = set()
@@ -1189,4 +1266,5 @@ else:
         _print_boot_info()
         if TOKEN: bot.run(TOKEN)
         else: print("FATAL: DISCORD_TOKEN/TOKEN not set.", flush=True)
+
 
