@@ -945,6 +945,27 @@ async def on_message(message: discord.Message):
     # Make sure commands still work
     await bot.process_commands(message)
 
+# Auto-join new threads in our target channels (even if not pinged)
+@bot.event
+async def on_thread_create(thread: discord.Thread):
+    try:
+        if thread.parent_id in {WELCOME_CHANNEL_ID, PROMO_CHANNEL_ID}:
+            await thread.join()  # works for public + (perms allowing) private
+    except Exception:
+        pass
+
+# If we ever get mentioned in a thread, join it so we can speak
+@bot.event
+async def on_message(message: discord.Message):
+    if isinstance(message.channel, discord.Thread):
+        th = message.channel
+        if th.parent_id in {WELCOME_CHANNEL_ID, PROMO_CHANNEL_ID}:
+            if bot.user and bot.user.mentioned_in(message):
+                try: await th.join()
+                except Exception: pass
+    await bot.process_commands(message)
+
+
 # ---------- Ready + health server ----------
 @bot.event
 async def on_ready():
@@ -978,3 +999,4 @@ else:
         _print_boot_info()
         if TOKEN: bot.run(TOKEN)
         else: print("FATAL: DISCORD_TOKEN/TOKEN not set.", flush=True)
+
