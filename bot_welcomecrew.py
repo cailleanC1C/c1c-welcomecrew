@@ -159,116 +159,79 @@ def _with_backoff(callable_fn, *a, **k):
                 continue
             raise
 
-# --- HELP CARD (improved readability) -----------------------------------------
+# --- HELP CARD (simple, table-style) -----------------------------------------
 from discord import app_commands
 from discord.ext import commands
 import os, discord
 
+# take over !help
 try:
     bot.remove_command("help")
 except Exception:
     pass
 
 HELP_ICON_URL = os.getenv("HELP_ICON_URL")
-HELP_STYLE_DEFAULT = os.getenv("HELP_STYLE_DEFAULT", "verbose").lower()  # verbose | compact
-
 EMBED_COLOR = 0x55CCFF
 
-def _mk_help_embed(style: str = HELP_STYLE_DEFAULT,
-                   guild: discord.Guild | None = None) -> discord.Embed:
-    style = (style or HELP_STYLE_DEFAULT).lower()
-    is_compact = style.startswith("c")  # compact
-
+def _mk_help_embed_simple(guild: discord.Guild | None = None) -> discord.Embed:
     e = discord.Embed(
         title="C1C-WelcomeCrew — Help",
         color=EMBED_COLOR,
-        description=(
-            "Tracks **Welcome** & **Promotion/Move** threads to Google Sheets, "
-            "prompts for missing clan tags, and provides backfill/dedupe tools."
-            "\n\n"
-            "**Quick Start**\n"
-            "1) Close a Welcome thread with `Ticket closed by <name>` → logged.\n"
-            "2) If the title lacks a tag, reply `Tag is F-XX` (or `C1C9`) in the thread.\n"
-            "3) Use `!sheetstatus` to confirm tabs and the service-account share."
-        ) if not is_compact else (
-            "Logs **Welcome** & **Promo/Move** threads • prompts for missing tags • "
-            "backfill & dedupe • notify-channel fallback • joins new threads automatically."
-        )
+        description="Tracks Welcome & Promotion/Move threads to Google Sheets and keeps things tidy."
     )
     if HELP_ICON_URL:
         e.set_thumbnail(url=HELP_ICON_URL)
 
-    # ——— Commands (two columns for readability) ———
-    col1 = [
-        "**Recruiters & Mods**",
-        "• Close Welcome with `Ticket closed by <name>`.",
-        "• Missing title tag? Reply `Tag is F-XX` / `C1C9`.",
-        "• Promo/Move type auto-detects (returning, move request, etc.).",
-    ]
-    col2 = [
-        "**Admin & Maintenance**",
-        "`!env_check` — show required env + hints",
-        "`!sheetstatus` — tabs + service account email",
-        "`!backfill_tickets` — scan threads + upsert (live progress)",
-        "`!backfill_details` — upload diffs/skips as a file",
-        "`!dedupe_sheet` — keep newest (Welcome by ticket; Promo by ticket+type+created)",
-        "`!watch_status` — watcher ON/OFF + last actions",
-        "`!reload` — clear sheet cache",
-        "`!checksheet` / `!health` — sheet sanity / bot health",
-        "`!reboot` — soft restart",
-    ]
+    # ——— User Actions ———
+    e.add_field(
+        name="User Actions — Recruiters & Mods",
+        value=(
+            "• When you close a ticket, I pick up **`Ticket closed by <name>`** and log it.\n"
+            "• If the title misses a clan tag, I prompt in-thread and accept replies like "
+            "**`Tag is F-XX`** or **`C1C9`**.\n"
+            "• I rename the thread to **`####-username-TAG`** and write the record to the stats sheet."
+        ),
+        inline=False,
+    )
 
-    # For compact mode, tighten and skip some items
-    if is_compact:
-        col1 = [
-            "**Recruiters & Mods**",
-            "• Close with `Ticket closed by <name>` → logged",
-            "• Missing tag? Reply `Tag is …` in thread",
-            "• Promo/Move type auto-detect",
-        ]
-        col2 = [
-            "**Admin & Maintenance**",
-            "`!sheetstatus`  `!backfill_tickets`  `!dedupe_sheet`",
-            "`!watch_status`  `!reload`  `!health`",
-        ]
-
-    e.add_field(name="User Actions", value="\n".join(col1), inline=True)
-    e.add_field(name="Commands", value="\n".join(col2), inline=True)
+    # ——— Commands (table-style via code block) ———
+    commands_table = (
+        "```\n"
+        "!env_check         show required env + hints\n"
+        "!sheetstatus       tabs + service account email\n"
+        "!backfill_tickets  scan threads + upsert (live progress)\n"
+        "!backfill_details  upload diffs/skips as a file\n"
+        "!dedupe_sheet      keep newest (Welcome by ticket; Promo by type+created)\n"
+        "!watch_status      watcher ON/OFF + last actions\n"
+        "!reload            clear sheet cache\n"
+        "!checksheet        sheet row counts\n"
+        "!health            bot & Sheets health\n"
+        "!reboot            soft restart\n"
+        "```"
+    )
+    e.add_field(name="Commands — Admin & Maintenance", value=commands_table, inline=False)
 
     # ——— Status ———
-    watchers_line = (
+    watchers = (
         f"Watchers: **{'ON' if ENABLE_LIVE_WATCH else 'OFF'}** "
         f"(welcome={'ON' if ENABLE_LIVE_WATCH_WELCOME else 'OFF'}, "
         f"promo={'ON' if ENABLE_LIVE_WATCH_PROMO else 'OFF'})"
     )
-    e.add_field(name="Status", value=watchers_line, inline=False)
+    e.add_field(name="Status", value=watchers, inline=False)
 
-    # ——— Notes (kept short; most people only need the first line) ———
-    notes = [
-        "• Set **WELCOME_CHANNEL_ID** and **PROMO_CHANNEL_ID**.",
-        "• Private threads: set **NOTIFY_CHANNEL_ID** and optional **NOTIFY_PING_ROLE_ID**.",
-        "• Clan tags source: sheet tab `clanlist` (default **column B**; override **CLANLIST_TAG_COLUMN**).",
-        "• Date stays blank unless a close message is found (unless `REQUIRE_CLOSE_MARKER_*` is ON).",
-        "• Times format in **TIMEZONE** (default UTC).",
-    ]
-    if not is_compact:
-        notes.insert(1, "• Bot auto-joins new threads in those channels and on mention.")
-
-    e.add_field(name="Notes", value="\n".join(notes), inline=False)
     e.set_footer(text="C1C • tidy logs, happy recruiters")
     return e
 
-# Prefix command: !help [style]
+# Prefix command: !help
 @bot.command(name="help")
-async def help_cmd(ctx: commands.Context, style: str | None = None):
-    await ctx.reply(embed=_mk_help_embed(style, ctx.guild), mention_author=False)
+async def help_cmd(ctx: commands.Context):
+    await ctx.reply(embed=_mk_help_embed_simple(ctx.guild), mention_author=False)
 
-# Slash command: /help (with style)
+# Slash command: /help (ephemeral)
 @bot.tree.command(name="help", description="Show WelcomeCrew help")
-@app_commands.describe(style="verbose or compact")
-async def slash_help(interaction: discord.Interaction, style: str | None = None):
+async def slash_help(interaction: discord.Interaction):
     await interaction.response.send_message(
-        embed=_mk_help_embed(style, interaction.guild),
+        embed=_mk_help_embed_simple(interaction.guild),
         ephemeral=True
     )
 # -----------------------------------------------------------------------------
@@ -1324,6 +1287,7 @@ else:
         _print_boot_info()
         if TOKEN: bot.run(TOKEN)
         else: print("FATAL: DISCORD_TOKEN/TOKEN not set.", flush=True)
+
 
 
 
