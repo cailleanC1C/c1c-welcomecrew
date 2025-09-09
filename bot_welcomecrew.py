@@ -210,6 +210,13 @@ def _mk_help_embed(guild: discord.Guild | None = None) -> discord.Embed:
         ),
         inline=False,
     )
+    e.add_field(
+        name="Status",
+        value=f"Watchers: {'ON' if ENABLE_LIVE_WATCH else 'OFF'} "
+              f"(welcome={'ON' if ENABLE_LIVE_WATCH_WELCOME else 'OFF'}, "
+              f"promo={'ON' if ENABLE_LIVE_WATCH_PROMO else 'OFF'})",
+        inline=False,
+    )
 
     e.add_field(
         name="Notes",
@@ -1276,6 +1283,7 @@ else:
         _print_boot_info()
         if TOKEN: bot.run(TOKEN)
         else: print("FATAL: DISCORD_TOKEN/TOKEN not set.", flush=True)
+
 
 
 
