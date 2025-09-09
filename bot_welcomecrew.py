@@ -811,6 +811,91 @@ def cmd_enabled(flag: bool):
         return wrapper
     return deco
 
+def _red(s: str, keep: int = 6) -> str:
+    if not s: return "(empty)"
+    if len(s) <= keep: return "*" * len(s)
+    return s[:keep] + "…" + "*" * 6
+
+@bot.command(name="env_check")
+async def cmd_env_check(ctx):
+    def ok(b): return "✅" if b else "❌"
+
+    # Required
+    req = {
+        "DISCORD_TOKEN": bool(os.getenv("DISCORD_TOKEN")),
+        "GSHEET_ID": bool(os.getenv("GSHEET_ID")),
+        "GOOGLE_SERVICE_ACCOUNT_JSON": bool(os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")),
+        "WELCOME_CHANNEL_ID": bool(int(os.getenv("WELCOME_CHANNEL_ID", "0"))),
+        "PROMO_CHANNEL_ID": bool(int(os.getenv("PROMO_CHANNEL_ID", "0"))),
+    }
+
+    # Parseables / optional infra
+    try:
+        sa_ok = bool(json.loads(os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON") or "{}").get("client_email"))
+    except Exception:
+        sa_ok = False
+
+    notify_id = int(os.getenv("NOTIFY_CHANNEL_ID", "0"))
+    notify_role = int(os.getenv("NOTIFY_PING_ROLE_ID", "0"))
+    tz = os.getenv("TIMEZONE", "UTC")
+    clan_col = int(os.getenv("CLANLIST_TAG_COLUMN", "2"))
+
+    toggles = {
+        "ENABLE_LIVE_WATCH": ENABLE_LIVE_WATCH,
+        "  welcome": ENABLE_LIVE_WATCH_WELCOME,
+        "  promo": ENABLE_LIVE_WATCH_PROMO,
+        "ENABLE_WELCOME_SCAN": ENABLE_WELCOME_SCAN,
+        "ENABLE_PROMO_SCAN": ENABLE_PROMO_SCAN,
+        "ENABLE_INFER_TAG_FROM_THREAD": ENABLE_INFER_TAG_FROM_THREAD,
+        "ENABLE_NOTIFY_FALLBACK": ENABLE_NOTIFY_FALLBACK,
+        "AUTO_POST_BACKFILL_DETAILS": AUTO_POST_BACKFILL_DETAILS,
+        "POST_BACKFILL_SUMMARY": POST_BACKFILL_SUMMARY,
+        "REQUIRE_CLOSE_MARKER_WELCOME": REQUIRE_CLOSE_MARKER_WELCOME,
+        "REQUIRE_CLOSE_MARKER_PROMO": REQUIRE_CLOSE_MARKER_PROMO,
+    }
+
+    lines = []
+    lines.append("**Env check**")
+    lines.append("Required:")
+    for k, v in req.items():
+        val_preview = ""
+        if k == "DISCORD_TOKEN":
+            val_preview = f" ({_red(os.getenv(k,''))})"
+        elif k in ("GSHEET_ID",):
+            val_preview = f" ({_red(os.getenv(k,''))})"
+        lines.append(f"• {ok(v)} {k}{val_preview}")
+
+    lines.append(f"• {ok(sa_ok)} GOOGLE_SERVICE_ACCOUNT_JSON → service account email readable")
+
+    lines.append("")
+    lines.append("IDs / misc:")
+    lines.append(f"• {ok(bool(notify_id))} NOTIFY_CHANNEL_ID = {notify_id or '(off)'}")
+    lines.append(f"• {ok(True)} NOTIFY_PING_ROLE_ID = {notify_role or '(off)'}")
+    lines.append(f"• {ok(True)} TIMEZONE = {tz}")
+    lines.append(f"• {ok(clan_col >= 1)} CLANLIST_TAG_COLUMN = {clan_col} (1=A, 2=B, …)")
+
+    lines.append("")
+    lines.append("Toggles:")
+    for k, v in toggles.items():
+        lines.append(f"• {ok(bool(v))} {k} = {'ON' if v else 'OFF'}")
+
+    # Friendly hints
+    hints = []
+    if not req["WELCOME_CHANNEL_ID"] or not req["PROMO_CHANNEL_ID"]:
+        hints.append("set numeric IDs for WELCOME_CHANNEL_ID and PROMO_CHANNEL_ID")
+    if ENABLE_NOTIFY_FALLBACK and not notify_id:
+        hints.append("set NOTIFY_CHANNEL_ID or turn ENABLE_NOTIFY_FALLBACK=OFF")
+    if clan_col != CLANLIST_TAG_COLUMN:
+        hints.append("CLANLIST_TAG_COLUMN didn’t parse as expected")
+    if hints:
+        lines.append("")
+        lines.append("_Hints:_ " + "; ".join(hints))
+
+    lines.append("")
+    lines.append("_Sheets tip:_ set **column A** (ticket number) to **Plain text** to keep leading zeros.")
+    await ctx.reply("\n".join(lines), mention_author=False)
+
+
 @bot.command(name="ping")
 @cmd_enabled(ENABLE_CMD_PING)
 async def cmd_ping(ctx): await ctx.reply("🏓 Pong — Live and listening.", mention_author=False)
@@ -1104,3 +1189,4 @@ else:
         _print_boot_info()
         if TOKEN: bot.run(TOKEN)
         else: print("FATAL: DISCORD_TOKEN/TOKEN not set.", flush=True)
+
