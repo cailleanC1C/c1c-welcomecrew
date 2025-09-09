@@ -47,6 +47,9 @@ ENABLE_CMD_CHECKSHEET      = env_bool("ENABLE_CMD_CHECKSHEET", True)
 ENABLE_CMD_REBOOT          = env_bool("ENABLE_CMD_REBOOT", True)
 ENABLE_WEB_SERVER          = env_bool("ENABLE_WEB_SERVER", True)
 
+CLANLIST_TAG_COLUMN = int(os.getenv("CLANLIST_TAG_COLUMN", "2"))  # 1-based; default B
+
+
 # ---------- Discord ----------
 intents = discord.Intents.default()
 intents.message_content = True
@@ -129,30 +132,53 @@ def _normalize_dashes(s: str) -> str:
 def _fmt_ticket(s: str) -> str:
     return (s or "").strip().lstrip("#").zfill(4)
 
+# ---- Clanlist cache ----
+_clan_tags_cache: List[str] = []
+_clan_tags_norm_set: set = set()
+_last_clan_fetch = 0.0
+_tag_regex_cache = None
+_tag_regex_key = ""
+
+def _normalize_dashes(s: str) -> str:
+    return re.sub(r"[\u2010\u2011\u2012\u2013\u2014\u2015]", "-", s or "")
+
 def _load_clan_tags(force: bool=False) -> List[str]:
     global _clan_tags_cache, _clan_tags_norm_set, _last_clan_fetch, _tag_regex_cache, _tag_regex_key
     now = time.time()
     if not force and _clan_tags_cache and (now - _last_clan_fetch < 300):
         return _clan_tags_cache
+
     tags: List[str] = []
     try:
         sh = gs_client().open_by_key(GSHEET_ID)
         ws = sh.worksheet(CLANLIST_TAB_NAME)
-        values = ws.get_all_values()
+        values = ws.get_all_values() or []
         if values:
-            header = [h.strip().lower() for h in values[0]]
-            col = header.index("clantag") if "clantag" in header else 0
+            header = [h.strip().lower() for h in values[0]] if values else []
+            # Prefer a header if present; otherwise use the configured column (B by default)
+            col_idx = None
+            for key in ("clantag", "tag", "abbr", "code"):
+                if key in header:
+                    col_idx = header.index(key)
+                    break
+            if col_idx is None:
+                # env is 1-based
+                col_idx = max(0, CLANLIST_TAG_COLUMN - 1)
+
             for row in values[1:]:
-                if col < len(row):
-                    t = _normalize_dashes(row[col]).strip().upper()
-                    if t: tags.append(t)
+                cell = row[col_idx] if col_idx < len(row) else ""
+                t = _normalize_dashes(cell).strip().upper()
+                if t:
+                    tags.append(t)
+
+        # dedupe while preserving order
         _clan_tags_cache = list(dict.fromkeys(tags))
         _clan_tags_norm_set = { _normalize_dashes(t).upper() for t in _clan_tags_cache }
         _last_clan_fetch = now
-        # rebuild combined regex
+
+        # rebuild combined regex (longest first)
         parts = sorted((_normalize_dashes(t).upper() for t in _clan_tags_cache), key=len, reverse=True)
         if parts:
-            # boundary = not [A-Za-z0-9_ ] around the tag (so hyphens inside tag are fine)
             alt = "|".join(re.escape(p) for p in parts)
             _tag_regex_cache = re.compile(rf"(?<![A-Za-z0-9_])(?:{alt})(?![A-Za-z0-9_])", re.IGNORECASE)
             _tag_regex_key = "|".join(parts)
@@ -709,7 +735,7 @@ async def cmd_clan_tags_debug(ctx):
     has_fit = "F-IT" in norm_set
     sample = ", ".join(list(tags)[:20]) or "(none)"
     await ctx.reply(
-        f"Loaded {len(tags)} clan tags. Has F-IT: {has_fit}\nSample: {sample}",
+        f"Loaded {len(tags)} clan tags from column {CLANLIST_TAG_COLUMN}. Has F-IT: {has_fit}\nSample: {sample}",
         mention_author=False
     )
 
@@ -800,3 +826,4 @@ else:
         _print_boot_info()
         if TOKEN: bot.run(TOKEN)
         else: print("FATAL: DISCORD_TOKEN/TOKEN not set.", flush=True)
+
