@@ -1,18 +1,18 @@
-# C1C – WelcomeCrew (v13)
-# - Live backfill with progress + clean stop (!backfill_stop)
-# - Clanlist-aware tag parsing (tags from column B by default), F-IT safe
-# - Welcome: infer clantag from latest message if title lacks it
-# - 4-digit ticket normalization; movers keyed by ticket+type+thread-created
-# - Verified appends; detailed diffs for updates; full skip reasons
-# - Active + archived thread scanning
+# C1C – WelcomeCrew (v14)
+# - Forgiving welcome title parsing; tag inference from latest message
+# - Clanlist tags from column B (configurable); F-IT-safe multi-part tags
+# - Throttled, backoff-retried Sheets writes (no extra verify reads)
+# - Live progress + !backfill_stop; detailed update diffs & skip reasons
+# - 4-digit tickets; movers keyed by ticket+type+thread-created; active+archived scans
 
-import os, json, re, asyncio, time, io
+import os, json, re, asyncio, time, io, random
 from datetime import datetime, timezone as _tz
 from typing import Optional, Tuple, Dict, Any, List
 
 import discord
 from discord.ext import commands
 import gspread
+from gspread.exceptions import APIError
 
 try:
     from zoneinfo import ZoneInfo
@@ -35,6 +35,9 @@ SHEET4_NAME        = os.getenv("SHEET4_NAME", "Sheet4")
 CLANLIST_TAB_NAME  = os.getenv("CLANLIST_TAB_NAME", "clanlist")
 # Which column in clanlist has the tags? (1-based; default 2 => column B)
 CLANLIST_TAG_COLUMN = int(os.getenv("CLANLIST_TAG_COLUMN", "2"))
+
+# Throttle/backoff for Google Sheets
+SHEETS_THROTTLE_MS = int(os.getenv("SHEETS_THROTTLE_MS", "200"))  # gap between writes
 
 # Feature toggles
 ENABLE_INFER_TAG_FROM_THREAD = env_bool("ENABLE_INFER_TAG_FROM_THREAD", True)
@@ -71,7 +74,7 @@ def fmt_tz(dt: datetime) -> str:
     return (dt or datetime.utcnow().replace(tzinfo=_tz.utc)).strftime("%Y-%m-%d %H:%M")
 
 def _print_boot_info():
-    print("=== WelcomeCrew v13 boot ===", flush=True)
+    print("=== WelcomeCrew v14 boot ===", flush=True)
     print(f"Sheets: {SHEET1_NAME} / {SHEET4_NAME} / clanlist:{CLANLIST_TAB_NAME} (tags col={CLANLIST_TAG_COLUMN})", flush=True)
     print(f"Welcome={WELCOME_CHANNEL_ID} Promo={PROMO_CHANNEL_ID}", flush=True)
     print(f"TZ={TIMEZONE} | infer-from-thread={ENABLE_INFER_TAG_FROM_THREAD}", flush=True)
@@ -118,6 +121,23 @@ def get_ws(name: str, want_headers: List[str]):
             pass
     _ws_cache[name] = ws
     return ws
+
+# ---------- Rate limit helpers ----------
+def _sleep_ms(ms:int):
+    if ms > 0:
+        time.sleep(ms/1000.0)
+
+def _with_backoff(callable_fn, *a, **k):
+    delay = 0.5
+    for attempt in range(6):
+        try:
+            return callable_fn(*a, **k)
+        except APIError as e:
+            if "429" in str(e):
+                _sleep_ms(int(delay*1000 + random.randint(0,200)))
+                delay *= 2
+                continue
+            raise
 
 # ---------- Clanlist & tag matching ----------
 _clan_tags_cache: List[str] = []
@@ -237,22 +257,7 @@ def ws_index_promo(name: str, ws) -> Dict[str,int]:
     _index_promo[name] = idx
     return idx
 
-# ---------- Diff / verify helpers ----------
-def _verify_find_exact(ws, value: str) -> Optional[int]:
-    try:
-        cell = ws.find(f"^{re.escape(value)}$", in_column=1, regex=True)
-        if cell: return cell.row
-    except Exception:
-        pass
-    try:
-        vals = ws.col_values(1)
-        for i in range(len(vals)-1, max(0, len(vals)-300), -1):
-            if (vals[i] or "").strip() == value:
-                return i+1
-    except Exception:
-        pass
-    return None
-
+# ---------- Diff helpers ----------
 def _calc_diffs(header: List[str], before: List[str], after: List[str]) -> List[str]:
     diffs = []
     for i, col in enumerate(header):
@@ -278,29 +283,30 @@ backfill_state = {
     "last_msg": ""
 }
 
-# ---------- Upserts (with diffs) ----------
+# ---------- Upserts (with diffs, throttled) ----------
 def upsert_welcome(name: str, ws, ticket: str, rowvals: List[str], st_bucket: dict) -> str:
     ticket = _fmt_ticket(ticket)
     idx = _index_simple.get(name) or ws_index_welcome(name, ws)
     header = HEADERS_SHEET1
     try:
-        if ticket in idx:
+        if ticket in idx and idx[ticket] > 0:
             row = idx[ticket]
-            before = ws.row_values(row)
+            # read current row (1 read) for diffs
+            before = _with_backoff(ws.row_values, row)
             rng = f"A{row}:{chr(ord('A')+len(rowvals)-1)}{row}"
-            ws.batch_update([{"range": rng, "values": [rowvals]}])
+            _sleep_ms(SHEETS_THROTTLE_MS)
+            _with_backoff(ws.batch_update, [{"range": rng, "values": [rowvals]}])
             diffs = _calc_diffs(header, before, rowvals)
             if diffs:
                 st_bucket["updated_details"].append(f"{ticket}: " + "; ".join(diffs))
             return "updated"
-        before_len = len(ws.col_values(1))
-        ws.append_row(rowvals, value_input_option="RAW")
-        after_len = len(ws.col_values(1))
-        if after_len > before_len or _verify_find_exact(ws, ticket):
-            _index_simple.setdefault(name, {})[ticket] = after_len
-            return "inserted"
-        else:
-            return "error"
+
+        # insert
+        _sleep_ms(SHEETS_THROTTLE_MS)
+        _with_backoff(ws.append_row, rowvals, value_input_option="RAW")
+        # mark index unknown row (-1) to avoid re-adding; rebuilt on next index
+        _index_simple.setdefault(name, {})[ticket] = _index_simple[name].get(ticket, -1)
+        return "inserted"
     except Exception as e:
         st_bucket["skipped_reasons"][ticket] = f"upsert error: {e}"
         print("Welcome upsert error:", e, flush=True)
@@ -330,30 +336,30 @@ def upsert_promo(name: str, ws, ticket: str, typ: str, created_str: str, rowvals
     try:
         if key in idx:
             row = idx[key]
-            before = ws.row_values(row)
+            before = _with_backoff(ws.row_values, row)
             rng = f"A{row}:{chr(ord('A')+len(rowvals)-1)}{row}"
-            ws.batch_update([{"range": rng, "values": [rowvals]}])
+            _sleep_ms(SHEETS_THROTTLE_MS)
+            _with_backoff(ws.batch_update, [{"range": rng, "values": [rowvals]}])
             diffs = _calc_diffs(header, before, rowvals)
             if diffs:
                 st_bucket["updated_details"].append(f"{ticket}:{typ}:{created_str}: " + "; ".join(diffs))
             return "updated"
         rpair = _find_promo_row_pair(ws, ticket, typ)
         if rpair:
-            before = ws.row_values(rpair)
+            before = _with_backoff(ws.row_values, rpair)
             rng = f"A{rpair}:{chr(ord('A')+len(rowvals)-1)}{rpair}"
-            ws.batch_update([{"range": rng, "values": [rowvals]}])
+            _sleep_ms(SHEETS_THROTTLE_MS)
+            _with_backoff(ws.batch_update, [{"range": rng, "values": [rowvals]}])
             ws_index_promo(name, ws)
             diffs = _calc_diffs(header, before, rowvals)
             if diffs:
                 st_bucket["updated_details"].append(f"{ticket}:{typ}:{created_str}: " + "; ".join(diffs))
             return "updated"
-        before_len = len(ws.col_values(1))
-        ws.append_row(rowvals, value_input_option="RAW")
-        after_len = len(ws.col_values(1))
+
+        _sleep_ms(SHEETS_THROTTLE_MS)
+        _with_backoff(ws.append_row, rowvals, value_input_option="RAW")
         ws_index_promo(name, ws)
-        if after_len > before_len or (_key_promo(ticket, typ, created_str) in _index_promo[name]):
-            return "inserted"
-        return "error"
+        return "inserted"
     except Exception as e:
         st_bucket["skipped_reasons"][f"{ticket}:{typ}:{created_str}"] = f"upsert error: {e}"
         print("Promo upsert error:", e, flush=True)
@@ -403,7 +409,8 @@ def dedupe_sheet(name: str, ws, has_type: bool=False) -> Tuple[int,int]:
     return (len(winners), deleted)
 
 # ---------- Parsing + inference ----------
-WELCOME_START_RX = re.compile(r'(?i)^closed-(\d{4})-(.+)$')
+# Forgiving: "Closed-0001-User-...", "Closed 0001 - User ...", or "0001-User ..."
+WELCOME_START_RX = re.compile(r'(?i)^(?:closed[- ]*)?(\d{4})[- ]+(.+)$')
 PROMO_START_RX   = re.compile(r'(?i)^.*?(\d{4})-(.+)$')
 
 def _clean_username(s: str) -> str:
@@ -440,25 +447,47 @@ async def infer_clantag_from_thread(thread: discord.Thread) -> Optional[str]:
 def parse_welcome_thread_name_allow_missing(name: str) -> Optional[Tuple[str,str,Optional[str]]]:
     """
     Parse ticket + username from title; tag may be None if title lacks it.
+    Works with:
+      - Closed-0001-User-CLAN
+      - 0001-User-CLAN
+      - 0001-User closed CLAN   (we'll still find CLAN)
     """
-    if not name: return None
-    m = WELCOME_START_RX.match(name.strip())
-    if not m: return None
-    ticket = _fmt_ticket(m.group(1))
-    remainder = m.group(2)
+    if not name:
+        return None
+    s = _normalize_dashes(name).strip()
 
+    m = WELCOME_START_RX.match(s)
+    if not m:
+        # last-chance fuzzy: find first 4-digit number anywhere then split after it
+        m2 = re.search(r'(\d{4})', s)
+        if not m2:
+            return None
+        ticket = _fmt_ticket(m2.group(1))
+        remainder = s[m2.end():].lstrip(" -")
+    else:
+        ticket = _fmt_ticket(m.group(1))
+        remainder = m.group(2)
+
+    # 1) best: suffix match against known tags (supports F-IT etc.)
     picked = _pick_tag_by_suffix(remainder, _load_clan_tags())
     if picked:
         username, tag = picked
         return (ticket, _clean_username(username), tag)
 
-    # no reliable tag in title; just return the username (tag=None)
-    return (ticket, _clean_username(_normalize_dashes(remainder)), None)
+    # 2) else: find a known tag ANYWHERE in the remainder
+    any_tag = _match_tag_in_text(remainder)
+    if any_tag:
+        left = remainder.upper().split(any_tag.upper(), 1)[0]
+        left = re.sub(r'\bclosed\b', '', left, flags=re.IGNORECASE)
+        return (ticket, _clean_username(left), any_tag)
+
+    # 3) no tag at all – still return the record (empty tag)
+    return (ticket, _clean_username(remainder), None)
 
 def parse_promo_thread_name(name: str) -> Optional[Tuple[str,str,str]]:
     """Closed-0000-username[-CLANTAG] (tag optional)."""
     if not name: return None
-    m = PROMO_START_RX.match(name.strip())
+    m = PROMO_START_RX.match((name or "").strip())
     if not m: return None
     ticket = _fmt_ticket(m.group(1))
     remainder = m.group(2)
