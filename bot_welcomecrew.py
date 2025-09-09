@@ -1,11 +1,12 @@
-# C1C – WelcomeCrew (v16)
+# C1C – WelcomeCrew (v17)
 # - Live watchers; notify-channel fallback (no DMs)
 # - Auto-join new threads / on-mention join
 # - Forgiving parsers; F-IT/multi-part tags; clanlist tags from column B
 # - Backfill leaves date blank if not closed; auto details attachment
 # - watch_status with last 5 actions
 # - Throttled/backoff Sheets writes; 4-digit tickets
-# -*- coding: utf-8 -*-
+# - Tag picker (dropdown) with timeout -> reload button, and plain-text tag replies
+# - Robust rename that wins the race vs. other bots (retries)
 
 import os, json, re, asyncio, time, io, random
 from datetime import datetime, timezone as _tz
@@ -94,7 +95,7 @@ def fmt_tz(dt: datetime) -> str:
     return (dt or datetime.utcnow().replace(tzinfo=_tz.utc)).strftime("%Y-%m-%d %H:%M")
 
 def _print_boot_info():
-    print("=== WelcomeCrew v16 boot ===", flush=True)
+    print("=== WelcomeCrew v17 boot ===", flush=True)
     print(f"Sheets: {SHEET1_NAME} / {SHEET4_NAME} / clanlist:{CLANLIST_TAB_NAME} (tags col={CLANLIST_TAG_COLUMN})", flush=True)
     print(f"Welcome={WELCOME_CHANNEL_ID} Promo={PROMO_CHANNEL_ID}", flush=True)
     print(f"TZ={TIMEZONE} | infer-from-thread={ENABLE_INFER_TAG_FROM_THREAD}", flush=True)
@@ -161,79 +162,60 @@ def _with_backoff(callable_fn, *a, **k):
             raise
 
 # --- HELP CARD (mobile, two-line bullets) ------------------------------------
-from discord import app_commands
-
-try:
-    bot.remove_command("help")
-except Exception:
-    pass
-
 HELP_ICON_URL = os.getenv("HELP_ICON_URL")
 EMBED_COLOR = 0x55CCFF
 
 def _mk_help_embed_mobile(guild: discord.Guild | None = None) -> discord.Embed:
     e = discord.Embed(
-        title=" 🌿 C1C-WelcomeCrew — Help",
+        title="🌿 C1C-WelcomeCrew — Help",
         color=EMBED_COLOR,
-        description="I help to track Welcome & Promotion/Move threads and keep things tidy."
+        description="Tracks Welcome & Promotion/Move threads, prompts for missing clan tags, and logs everything to Google Sheets."
     )
     if HELP_ICON_URL:
         e.set_thumbnail(url=HELP_ICON_URL)
 
-    # ——— User Actions ———
     e.add_field(
         name="User Actions — Recruiters & Mods",
         value=(
-            "On Close Ticket, I pick up **`Ticket closed by <name>`** and log it.\n"
-            "I’ll prompt in-thread and accept replies like **`C1C9`**.\n"
-            "I rename the thread to **`Closed-####-username-TAG`** and write the record to the stats sheet."
+            "• When you close a ticket, I detect **Ticket closed by <name>** and log it.\n"
+            "• I’ll prompt in-thread for the clan tag (dropdown) and also accept a plain reply like `C1C9`.\n"
+            "• I rename the thread to **Closed-####-username-TAG** and write the record to the sheet."
         ),
         inline=False,
     )
 
-    # ——— Commands (two-line layout per item) ———
-    commands_pairs = [
+    pairs = [
         ("!env_check",        "show required env + hints"),
         ("!sheetstatus",      "tabs + service account email"),
-        ("!backfill_tickets", "scan threads, show live status"),
+        ("!backfill_tickets", "scan threads + upsert (live progress)"),
         ("!backfill_details", "upload diffs/skips as a file"),
-        ("!dedupe_sheet",     "keep newest entry"),
+        ("!dedupe_sheet",     "keep newest entries"),
         ("!watch_status",     "watcher ON/OFF + last actions"),
         ("!reload",           "clear sheet cache"),
         ("!checksheet",       "sheet row counts"),
         ("!health",           "bot & Sheets health"),
         ("!reboot",           "soft restart"),
     ]
-    commands_lines = "\n".join([f"🔹 `{cmd}`\n  → {desc}" for cmd, desc in commands_pairs])
-    e.add_field(name="Commands — Admin & Maintenance", value=commands_lines, inline=False)
+    lines = "\n".join([f"🔹 `{c}`\n  → {d}" for c,d in pairs])
+    e.add_field(name="Commands — Admin & Maintenance", value=lines, inline=False)
 
-    # ——— Status ———
     watchers = (
         f"Watchers: **{'ON' if ENABLE_LIVE_WATCH else 'OFF'}** "
         f"(welcome={'ON' if ENABLE_LIVE_WATCH_WELCOME else 'OFF'}, "
         f"promo={'ON' if ENABLE_LIVE_WATCH_PROMO else 'OFF'})"
     )
     e.add_field(name="Status", value=watchers, inline=False)
-
-    e.set_footer(text="C1C 🔹 tidy logs, happy recruiters")
+    e.set_footer(text="C1C • tidy logs, happy recruiters")
     return e
 
-# Prefix: !help
 @bot.command(name="help")
 async def help_cmd(ctx: commands.Context):
     await ctx.reply(embed=_mk_help_embed_mobile(ctx.guild), mention_author=False)
 
-# Slash: /help (ephemeral)
 @bot.tree.command(name="help", description="Show WelcomeCrew help")
 async def slash_help(interaction: discord.Interaction):
-    await interaction.response.send_message(
-        embed=_mk_help_embed_mobile(interaction.guild),
-        ephemeral=True
-    )
-# -----------------------------------------------------------------------------
+    await interaction.response.send_message(embed=_mk_help_embed_mobile(interaction.guild), ephemeral=True)
 
-
-# --- Ensure slash commands are visible (once per boot) -----------------------
 @bot.event
 async def setup_hook():
     try:
@@ -241,7 +223,6 @@ async def setup_hook():
         print("Slash commands synced.", flush=True)
     except Exception as e:
         print(f"Slash sync failed: {e}", flush=True)
-# -----------------------------------------------------------------------------
 
 # ---------- Clanlist & tag matching ----------
 _clan_tags_cache: List[str] = []
@@ -250,8 +231,7 @@ _last_clan_fetch = 0.0
 _tag_regex_cache = None
 
 def _normalize_dashes(s: str) -> str:
-    # en/em/figure hyphens -> ASCII '-'
-    return re.sub(r"[\u2010\u2011\u2012\u2013\u2014\u2015]", "-", s or "")
+    return re.sub(r"[\u2010-\u2015]", "-", s or "")
 
 def _fmt_ticket(s: str) -> str:
     return (s or "").strip().lstrip("#").zfill(4)
@@ -306,17 +286,13 @@ def _match_tag_in_text(text: str) -> Optional[str]:
     return m.group(0).upper() if m else None
 
 def _pick_tag_by_suffix(remainder: str, known_tags: List[str]) -> Optional[Tuple[str, str]]:
-    """
-    Try to find a '-TAG' suffix where TAG is in known_tags.
-    Supports multi-segment tags like 'F-IT'. Checks last 1..3 segments.
-    """
     s = _normalize_dashes(remainder).strip()
     parts = [p for p in s.split("-") if p != ""]
     if not parts:
         return None
     norm_tags = _clan_tags_norm_set or { _normalize_dashes(t).upper() for t in known_tags }
-    max_k = min(3, len(parts))  # allow up to 3-part tags
-    for k in range(max_k, 0, -1):  # longest suffix first
+    max_k = min(3, len(parts))
+    for k in range(max_k, 0, -1):
         cand = "-".join(parts[-k:]).upper()
         if cand in norm_tags:
             username = "-".join(parts[:-k])
@@ -515,7 +491,7 @@ def _aggregate_msg_text(msg: discord.Message) -> str:
     parts = [msg.content or ""]
     for e in msg.embeds or []:
         parts += [e.title or "", e.description or ""]
-        if e.author and e.author.name: parts.append(e.author.name)
+        if getattr(e, "author", None) and e.author.name: parts.append(e.author.name)
         for f in e.fields or []:
             parts += [f.name or "", f.value or ""]
     return " | ".join(parts)
@@ -673,7 +649,123 @@ def _who_to_ping(msg: discord.Message, thread: discord.Thread) -> Optional[disco
     except Exception:
         return None
 
-# ---------- Prompt for tag (dropdown + safe fallback) ----------
+# ---------- Pending states (used by picker & watchers) ----------
+_pending_welcome: Dict[int, Dict[str, Any]] = {}  # thread_id -> {ticket, username, close_dt}
+_pending_promo:   Dict[int, Dict[str, Any]] = {}
+
+# ---------- Tag picker (with timeout -> reload button) ----------
+def _chunks(seq, n):
+    for i in range(0, len(seq), n):
+        yield seq[i:i+n]
+
+class TagPickerView(discord.ui.View):
+    """Dropdown tag picker. mode ∈ {'welcome','promo'}."""
+    def __init__(self, mode: str, thread: discord.Thread, ticket: str, username: str,
+                 tags: List[str]):
+        super().__init__(timeout=600)
+        self.mode = mode
+        self.thread = thread
+        self.ticket = _fmt_ticket(ticket)
+        self.username = username
+        self.tags = [t.strip().upper() for t in tags if t and t.strip()]
+        self.pages = list(_chunks(self.tags, 25)) or [[]]
+        self.page  = 0
+        self.message: Optional[discord.Message] = None
+
+        self.select = discord.ui.Select(
+            placeholder=f"Choose clan tag • Page 1/{len(self.pages)}",
+            min_values=1, max_values=1,
+            options=[discord.SelectOption(label=t, value=t) for t in self.pages[0]]
+        )
+        async def _on_select(interaction: discord.Interaction):
+            tag = self.select.values[0]
+            await self._handle_pick(interaction, tag)
+        self.select.callback = _on_select
+        self.add_item(self.select)
+
+        if len(self.pages) > 1:
+            prev_btn = discord.ui.Button(label="◀ Prev", style=discord.ButtonStyle.secondary)
+            next_btn = discord.ui.Button(label="Next ▶", style=discord.ButtonStyle.secondary)
+
+            async def _prev_cb(interaction: discord.Interaction):
+                self.page = (self.page - 1) % len(self.pages)
+                self._refresh()
+                await interaction.response.edit_message(view=self)
+
+            async def _next_cb(interaction: discord.Interaction):
+                self.page = (self.page + 1) % len(self.pages)
+                self._refresh()
+                await interaction.response.edit_message(view=self)
+
+            prev_btn.callback = _prev_cb
+            next_btn.callback = _next_cb
+            self.add_item(prev_btn); self.add_item(next_btn)
+
+    def _refresh(self):
+        self.select.options = [discord.SelectOption(label=t, value=t) for t in self.pages[self.page]]
+        self.select.placeholder = f"Choose clan tag • Page {self.page+1}/{len(self.pages)}"
+
+    async def _handle_pick(self, interaction: discord.Interaction, tag: str):
+        pending = (_pending_welcome if self.mode == "welcome" else _pending_promo)
+        info = pending.get(self.thread.id) or {}
+        ticket   = info.get("ticket", self.ticket)
+        username = info.get("username", self.username)
+        close_dt = info.get("close_dt")
+
+        pending.pop(self.thread.id, None)
+
+        if self.mode == "welcome":
+            await _finalize_welcome(self.thread, ticket, username, tag, close_dt)
+        else:
+            await _finalize_promo(self.thread, ticket, username, tag, close_dt)
+
+        for item in self.children:
+            item.disabled = True
+        await interaction.response.edit_message(
+            content=f"Got it — set clan tag to **{tag}** and logged to the sheet. ✅",
+            view=self
+        )
+
+    async def on_timeout(self):
+        pending = (_pending_welcome if self.mode == "welcome" else _pending_promo)
+        if self.thread.id not in pending:
+            return
+        try:
+            for item in self.children:
+                item.disabled = True
+            note = "⏳ Tag picker expired. Tap **Reload picker** below, or just reply with the tag (e.g., `C1C9`)."
+            if self.message:
+                await self.message.edit(content=note, view=TagPickerReloadView(self))
+        except Exception:
+            pass
+
+class TagPickerReloadView(discord.ui.View):
+    """Shown after timeout; lets a recruiter reload the picker (no re-ping)."""
+    def __init__(self, original: TagPickerView):
+        super().__init__(timeout=600)
+        self.original = original
+
+    @discord.ui.button(label="Reload picker", style=discord.ButtonStyle.primary, emoji="🔄")
+    async def reload(self, interaction: discord.Interaction, button: discord.ui.Button):
+        pending = (_pending_welcome if self.original.mode == "welcome" else _pending_promo)
+        if self.original.thread.id not in pending:
+            await interaction.response.edit_message(content="Already logged — picker closed.", view=None)
+            return
+        new_view = TagPickerView(
+            self.original.mode,
+            self.original.thread,
+            self.original.ticket,
+            self.original.username,
+            self.original.tags
+        )
+        await interaction.response.edit_message(
+            content=(f"Which clan tag for **{self.original.username}** (ticket **{self.original.ticket}**)?\n"
+                     "Pick one from the menu, or reply with the tag (e.g., `C1C9`)."),
+            view=new_view
+        )
+        new_view.message = interaction.message
+
+# ---------- Prompt for tag ----------
 async def _prompt_for_tag(thread: discord.Thread, ticket: str, username: str,
                           msg_to_reply: Optional[discord.Message], mode: str):
     tags = _load_clan_tags(False) or []
@@ -681,10 +773,8 @@ async def _prompt_for_tag(thread: discord.Thread, ticket: str, username: str,
     mention = f"{closer.mention} " if closer else ""
     content = (
         f"{mention}Which clan tag for **{username}** (ticket **{_fmt_ticket(ticket)}**)?\n"
-        "Pick one from the menu below, or reply with `Tag is <TAG>`."
+        "Pick one from the menu below, or reply with the tag (e.g., `C1C9`)."
     )
-
-    # Try in-thread (joining if needed)
     try:
         view = TagPickerView(mode, thread, ticket, username, tags)
         sent = await thread.send(content, view=view, suppress_embeds=True)
@@ -702,44 +792,76 @@ async def _prompt_for_tag(thread: discord.Thread, ticket: str, username: str,
     except Exception:
         pass
 
-    # Single fallback to notify channel (no double-send)
     prefix = _notify_prefix(thread.guild, closer)
     await _notify_channel(
         thread.guild,
         f"{prefix}Need clan tag for **{username}** (ticket **{_fmt_ticket(ticket)}**) → {thread_link(thread)}"
     )
 
-# ---------- Finalizers (log + optional rename) ----------
-async def _rename_welcome_thread_if_needed(thread: discord.Thread, ticket: str, username: str, clantag: str) -> bool:
-    """
-    Ensure welcome threads are named exactly: Closed-####-username-TAG
-    (keeps a single 'Closed-' prefix; avoids double-prefixing)
-    """
+# ---------- Finalizers (log + robust rename) ----------
+async def _fetch_thread_name(thread: discord.Thread) -> str:
+    """Get the freshest name (guild.fetch_channel avoids stale cache)."""
     try:
-        core = f"{_fmt_ticket(ticket)}-{username}-{clantag}".strip("-")
-        desired = f"Closed-{core}"
-        current = (thread.name or "").strip()
-
-        # normalize any variant like 'closed #### - user - TAG' to canonical 'Closed-####-user-TAG'
-        cur_norm = _normalize_dashes(current)
-        if cur_norm.lower().startswith("closed-"):
-            cur_norm = "Closed-" + cur_norm[7:]  # normalize case of prefix
-
-        if cur_norm != desired and clantag:
-            await thread.edit(name=desired)
-            return True
-    except discord.Forbidden:
-        pass
+        fresh = await thread.guild.fetch_channel(thread.id)
+        return (fresh.name or "").strip()
     except Exception:
-        pass
-    return False
+        return (thread.name or "").strip()
+
+def _desired_closed_name(ticket: str, username: str, clantag: str) -> str:
+    core = f"{_fmt_ticket(ticket)}-{username}-{clantag}".strip("-")
+    return f"Closed-{core}"
+
+async def _rename_welcome_thread_if_needed(
+    thread: discord.Thread,
+    ticket: str,
+    username: str,
+    clantag: str,
+) -> bool:
+    """
+    Ensure welcome threads are named exactly: Closed-####-username-TAG.
+    Waits briefly and retries to beat follow-up renames from other bots.
+    """
+    if not clantag:
+        return False
+
+    desired = _desired_closed_name(ticket, username, clantag)
+
+    current = _normalize_dashes(await _fetch_thread_name(thread))
+    if current.lower().startswith("closed-"):
+        current = "Closed-" + current[7:]
+
+    if current == desired:
+        return False
+
+    delays = [1.0, 3.0, 6.0]  # seconds
+    renamed = False
+    for delay in delays:
+        try:
+            await asyncio.sleep(delay)
+            now = await _fetch_thread_name(thread)
+            if now == desired:
+                renamed = False
+                break
+
+            await thread.edit(name=desired)
+            renamed = True
+
+            await asyncio.sleep(0.5)
+            if (await _fetch_thread_name(thread)) == desired:
+                break
+        except discord.Forbidden:
+            renamed = False
+            break
+        except Exception:
+            pass
+
+    return renamed
 
 async def _finalize_welcome(thread: discord.Thread, ticket: str, username: str, clantag: str, close_dt: Optional[datetime]):
     ws = get_ws(SHEET1_NAME, HEADERS_SHEET1)
     renamed = await _rename_welcome_thread_if_needed(thread, ticket, username, clantag or "")
     if renamed:
         log_action("welcome", "renamed", ticket=_fmt_ticket(ticket), username=username, clantag=clantag or "", link=thread_link(thread))
-    # leave date blank if not closed
     date_str = fmt_tz(close_dt) if close_dt else ""
     row = [_fmt_ticket(ticket), username, clantag or "", date_str]
     dummy_bucket = _new_bucket()
@@ -801,7 +923,6 @@ async def _handle_welcome_thread(th: discord.Thread, ws, st):
     if not clantag:
         inferred = await infer_clantag_from_thread(th)
         clantag = inferred or ""
-    # date closed: blank if not found or if strict env requires marker and it's missing
     dt = await find_close_timestamp(th)
     if REQUIRE_CLOSE_MARKER_WELCOME and not dt:
         date_str = ""
@@ -893,32 +1014,15 @@ async def detect_promo_type(thread: discord.Thread) -> Optional[str]:
 
 # ---------- Auto-post helper for details ----------
 def _build_backfill_details_text() -> str:
-    # Be defensive in case state buckets are missing
-    w = backfill_state.get("welcome", _new_bucket())
-    p = backfill_state.get("promo", _new_bucket())
-
-    def section(title: str, rows: List[str]) -> List[str]:
-        out: List[str] = [title]
-        out.extend(rows if rows else ["(none)"])
-        out.append("")  # blank line
-        return out
-
-    w_updates = list(w.get("updated_details", []))
-    w_skipped_pairs = (w.get("skipped_reasons", {}) or {}).items()
-    w_skipped = [f"{k} -> {v}" for (k, v) in w_skipped_pairs]
-
-    p_updates = list(p.get("updated_details", []))
-    p_skipped_pairs = (p.get("skipped_reasons", {}) or {}).items()
-    p_skipped = [f"{k} -> {v}" for (k, v) in p_skipped_pairs]
-
+    w = backfill_state["welcome"]; p = backfill_state["promo"]
+    def section(title, lines):
+        return [title] + (lines if lines else ["(none)"]) + [""]
     lines: List[str] = []
-    lines += section("WELCOME - UPDATED (with diffs):", w_updates)
-    lines += section("WELCOME - SKIPPED (id -> reason):", w_skipped)
-    lines += section("PROMO - UPDATED (with diffs):", p_updates)
-    lines += section("PROMO - SKIPPED (id -> reason):", p_skipped)
-
-    return "\n".join(lines) if lines else "(empty)"
-
+    lines += section("WELCOME — UPDATED (with diffs):", w["updated_details"])
+    lines += section("WELCOME — SKIPPED (id -> reason):", [f"{k} -> {v}" for k,v in w["skipped_reasons"].items()])
+    lines += section("PROMO — UPDATED (with diffs):", p["updated_details"])
+    lines += section("PROMO — SKIPPED (id -> reason):", [f"{k} -> {v}" for k,v in p["skipped_reasons"].items()])
+    return "\n".join(lines) or "(empty)"
 
 # ---------- Commands ----------
 def cmd_enabled(flag: bool):
@@ -939,7 +1043,6 @@ def _red(s: str, keep: int = 6) -> str:
 async def cmd_env_check(ctx):
     def ok(b): return "✅" if b else "❌"
 
-    # Required
     req = {
         "DISCORD_TOKEN": bool(os.getenv("DISCORD_TOKEN")),
         "GSHEET_ID": bool(os.getenv("GSHEET_ID")),
@@ -948,7 +1051,6 @@ async def cmd_env_check(ctx):
         "PROMO_CHANNEL_ID": bool(int(os.getenv("PROMO_CHANNEL_ID", "0"))),
     }
 
-    # Parseables / optional infra
     try:
         sa_ok = bool(json.loads(os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON") or "{}").get("client_email"))
     except Exception:
@@ -978,9 +1080,7 @@ async def cmd_env_check(ctx):
     lines.append("Required:")
     for k, v in req.items():
         val_preview = ""
-        if k == "DISCORD_TOKEN":
-            val_preview = f" ({_red(os.getenv(k,''))})"
-        elif k in ("GSHEET_ID",):
+        if k in ("DISCORD_TOKEN","GSHEET_ID"):
             val_preview = f" ({_red(os.getenv(k,''))})"
         lines.append(f"• {ok(v)} {k}{val_preview}")
 
@@ -998,7 +1098,6 @@ async def cmd_env_check(ctx):
     for k, v in toggles.items():
         lines.append(f"• {ok(bool(v))} {k} = {'ON' if v else 'OFF'}")
 
-    # Friendly hints
     hints = []
     if not req["WELCOME_CHANNEL_ID"] or not req["PROMO_CHANNEL_ID"]:
         hints.append("set numeric IDs for WELCOME_CHANNEL_ID and PROMO_CHANNEL_ID")
@@ -1011,7 +1110,7 @@ async def cmd_env_check(ctx):
         lines.append("_Hints:_ " + "; ".join(hints))
 
     lines.append("")
-    lines.append("_Sheets tip:_ set **column A** (ticket number) to **Plain text** to keep leading zeros.")
+    lines.append("_Sheets tip:_ set column A (ticket number) to Plain text to keep leading zeros.")
     await ctx.reply("\n".join(lines), mention_author=False)
 
 @bot.command(name="ping")
@@ -1183,130 +1282,7 @@ async def cmd_reboot(ctx):
 async def cmd_watch_status(ctx):
     await ctx.reply(render_watch_status_text(), mention_author=False)
 
-# --- Clan Tag Picker (timeout UX: reload button + type fallback, no re-ping) --
-def _chunks(seq, n):
-    for i in range(0, len(seq), n):
-        yield seq[i:i+n]
-
-class TagPickerReloadView(discord.ui.View):
-    """Shown after timeout; lets a recruiter reload the picker (no re-ping)."""
-    def __init__(self, original: "TagPickerView"):
-        super().__init__(timeout=600)
-        self.original = original
-
-    @discord.ui.button(label="Reload picker", style=discord.ButtonStyle.primary, emoji="🔄")
-    async def reload(self, interaction: discord.Interaction, button: discord.ui.Button):
-        pending = (_pending_welcome if self.original.mode == "welcome" else _pending_promo)
-        if self.original.thread.id not in pending:
-            await interaction.response.edit_message(content="Already logged — picker closed.", view=None)
-            return
-
-        # refresh clanlist so new/removed tags show up
-        fresh_tags = _load_clan_tags(False) or []
-
-        new_view = TagPickerView(
-            self.original.mode,
-            self.original.thread,
-            self.original.ticket,
-            self.original.username,
-            fresh_tags
-        )
-        await interaction.response.edit_message(
-            content=(f"Which clan tag for **{self.original.username}** (ticket **{self.original.ticket}**)?\n"
-                     "Pick one from the menu below, or reply with `Tag is <TAG>`."),
-            view=new_view
-        )
-        new_view.message = interaction.message  # keep handle for any future timeout
-
-class TagPickerView(discord.ui.View):
-    """Dropdown tag picker. mode ∈ {'welcome','promo'}."""
-    def __init__(self, mode: str, thread: discord.Thread, ticket: str, username: str,
-                 tags: List[str]):
-        super().__init__(timeout=600)
-        self.mode = mode
-        self.thread = thread
-        self.ticket = _fmt_ticket(ticket)
-        self.username = username
-        self.tags = [t.strip().upper() for t in tags if t and t.strip()]
-        self.pages = list(_chunks(self.tags, 25)) or [[]]
-        self.page  = 0
-        self.message: Optional[discord.Message] = None
-
-        # Dropdown
-        self.select = discord.ui.Select(
-            placeholder=f"Choose clan tag • Page 1/{len(self.pages)}",
-            min_values=1, max_values=1,
-            options=[discord.SelectOption(label=t, value=t) for t in self.pages[0]]
-        )
-        async def _on_select(interaction: discord.Interaction):
-            tag = self.select.values[0]
-            await self._handle_pick(interaction, tag)
-        self.select.callback = _on_select
-        self.add_item(self.select)
-
-        # Pager if >25 options
-        if len(self.pages) > 1:
-            prev_btn = discord.ui.Button(label="◀ Prev", style=discord.ButtonStyle.secondary)
-            next_btn = discord.ui.Button(label="Next ▶", style=discord.ButtonStyle.secondary)
-
-            async def _prev_cb(interaction: discord.Interaction):
-                self.page = (self.page - 1) % len(self.pages)
-                self._refresh()
-                await interaction.response.edit_message(view=self)
-
-            async def _next_cb(interaction: discord.Interaction):
-                self.page = (self.page + 1) % len(self.pages)
-                self._refresh()
-                await interaction.response.edit_message(view=self)
-
-            prev_btn.callback = _prev_cb
-            next_btn.callback = _next_cb
-            self.add_item(prev_btn); self.add_item(next_btn)
-
-    def _refresh(self):
-        self.select.options = [discord.SelectOption(label=t, value=t) for t in self.pages[self.page]]
-        self.select.placeholder = f"Choose clan tag • Page {self.page+1}/{len(self.pages)}"
-
-    async def _handle_pick(self, interaction: discord.Interaction, tag: str):
-        pending = (_pending_welcome if self.mode == "welcome" else _pending_promo)
-        info = pending.get(self.thread.id) or {}
-        ticket   = info.get("ticket", self.ticket)
-        username = info.get("username", self.username)
-        close_dt = info.get("close_dt")
-
-        pending.pop(self.thread.id, None)  # mark handled
-
-        if self.mode == "welcome":
-            await _finalize_welcome(self.thread, ticket, username, tag, close_dt)
-        else:
-            await _finalize_promo(self.thread, ticket, username, tag, close_dt)
-
-        for item in self.children:
-            item.disabled = True
-        await interaction.response.edit_message(
-            content=f"Got it — set clan tag to **{tag}** and logged to the sheet. ✅",
-            view=self
-        )
-
-    async def on_timeout(self):
-        """Expire quietly, offer reload, suggest typing the tag. No re-ping."""
-        pending = (_pending_welcome if self.mode == "welcome" else _pending_promo)
-        if self.thread.id not in pending:
-            return  # already processed elsewhere
-
-        try:
-            for item in self.children:
-                item.disabled = True
-            note = "⏳ Tag picker expired. You can **Reload picker** below, or just reply with `Tag is <TAG>`."
-            if self.message:
-                await self.message.edit(content=note, view=TagPickerReloadView(self))
-        except Exception:
-            pass
-
 # ---------- LIVE WATCHERS ----------
-_pending_welcome: Dict[int, Dict[str, Any]] = {}  # thread_id -> {ticket, username, close_dt}
-_pending_promo:   Dict[int, Dict[str, Any]] = {}
-
 def _is_thread_in_parent(thread: discord.Thread, parent_id: int) -> bool:
     try:
         return thread and thread.parent_id == parent_id
@@ -1315,7 +1291,6 @@ def _is_thread_in_parent(thread: discord.Thread, parent_id: int) -> bool:
 
 @bot.event
 async def on_thread_create(thread: discord.Thread):
-    # Auto-join new threads in our target channels (even if not pinged)
     try:
         if thread.parent_id in {WELCOME_CHANNEL_ID, PROMO_CHANNEL_ID}:
             await thread.join()
@@ -1324,10 +1299,8 @@ async def on_thread_create(thread: discord.Thread):
 
 @bot.event
 async def on_message(message: discord.Message):
-    # Only handle thread messages for watchers (commands still processed at end)
     if isinstance(message.channel, discord.Thread):
         th = message.channel
-        # If mentioned, join to ensure we can speak
         if th.parent_id in {WELCOME_CHANNEL_ID, PROMO_CHANNEL_ID}:
             if bot.user and bot.user.mentioned_in(message):
                 try: await th.join()
@@ -1391,7 +1364,6 @@ async def on_message(message: discord.Message):
                             except Exception:
                                 pass
 
-    # Always let commands run
     await bot.process_commands(message)
 
 # ---------- Ready + health server ----------
@@ -1427,4 +1399,3 @@ else:
         _print_boot_info()
         if TOKEN: bot.run(TOKEN)
         else: print("FATAL: DISCORD_TOKEN/TOKEN not set.", flush=True)
-
