@@ -38,6 +38,11 @@ SHEET1_NAME        = os.getenv("SHEET1_NAME", "Sheet1")
 SHEET4_NAME        = os.getenv("SHEET4_NAME", "Sheet4")
 CLANLIST_TAB_NAME  = os.getenv("CLANLIST_TAB_NAME", "clanlist")
 CLANLIST_TAG_COLUMN = int(os.getenv("CLANLIST_TAG_COLUMN", "2"))  # 1-based; default B
+# Scheduled refresh config
+REFRESH_TIMES = os.getenv("REFRESH_TIMES", "02:00,10:00,18:00")  # 24h times, comma-separated
+CLAN_TAGS_CACHE_TTL_SEC = int(os.getenv("CLAN_TAGS_CACHE_TTL_SEC", "28800"))  # 8h default
+LOG_CHANNEL_ID = int(os.getenv("LOG_CHANNEL_ID", "0"))  # optional: where to post "refreshed" pings
+
 
 SHEETS_THROTTLE_MS = int(os.getenv("SHEETS_THROTTLE_MS", "200"))
 
@@ -252,7 +257,7 @@ def _fmt_ticket(s: str) -> str:
 def _load_clan_tags(force: bool=False) -> List[str]:
     global _clan_tags_cache, _clan_tags_norm_set, _last_clan_fetch, _tag_regex_cache
     now = time.time()
-    if not force and _clan_tags_cache and (now - _last_clan_fetch < 300):
+    if not force and _clan_tags_cache and (now - _last_clan_fetch < CLAN_TAGS_CACHE_TTL_SEC):
         return _clan_tags_cache
 
     tags: List[str] = []
@@ -1277,6 +1282,81 @@ class TagPickerView(discord.ui.View):
             pass
 
 # ---------- LIVE WATCHERS ----------
+# ---------- Scheduled refresh (3x/day via REFRESH_TIMES) ----------
+_refresh_task: Optional[asyncio.Task] = None
+
+def _parse_times_csv(s: str) -> List[Tuple[int, int]]:
+    out: List[Tuple[int, int]] = []
+    for tok in (s or "").split(","):
+        tok = tok.strip()
+        if not tok: 
+            continue
+        try:
+            h, m = map(int, tok.split(":"))
+            h = max(0, min(23, h)); m = max(0, min(59, m))
+            out.append((h, m))
+        except Exception:
+            pass
+    # de-dup + sort; default to 02:00,10:00,18:00 if none valid
+    out = sorted(set(out))
+    return out or [(2, 0), (10, 0), (18, 0)]
+
+async def _sleep_until(dt: datetime):
+    now = datetime.now(dt.tzinfo)
+    secs = (dt - now).total_seconds()
+    if secs > 0:
+        await asyncio.sleep(secs)
+
+async def scheduled_refresh_loop():
+    # timezone
+    try:
+        tz = ZoneInfo(TIMEZONE) if ZoneInfo else _tz.utc
+    except Exception:
+        tz = _tz.utc
+    times = _parse_times_csv(REFRESH_TIMES)
+    print(f"[refresh] TZ={TIMEZONE} times={times}", flush=True)
+
+    while True:
+        now = datetime.now(tz)
+        today_candidates = [
+            now.replace(hour=h, minute=m, second=0, microsecond=0)
+            for (h, m) in times
+            if now.replace(hour=h, minute=m, second=0, microsecond=0) > now
+        ]
+        if today_candidates:
+            next_dt = min(today_candidates)
+        else:
+            h, m = times[0]
+            next_dt = (now + _tz.timedelta(days=1)).replace(hour=h, minute=m, second=0, microsecond=0)
+
+        await _sleep_until(next_dt)
+
+        # Do the actual refresh:
+        try:
+            # force-reload clan tags (main read this bot does)
+            _ = _load_clan_tags(force=True)
+
+            # (Optional) warm worksheets so first write after refresh is snappy
+            try:
+                get_ws(SHEET1_NAME, HEADERS_SHEET1)
+                get_ws(SHEET4_NAME, HEADERS_SHEET4)
+            except Exception:
+                pass
+
+            # Log to channel if configured
+            if LOG_CHANNEL_ID:
+                ch = bot.get_channel(LOG_CHANNEL_ID)
+                if isinstance(ch, (discord.TextChannel, discord.Thread)):
+                    when_local = next_dt.astimezone(tz).strftime("%Y-%m-%d %H:%M")
+                    try:
+                        await ch.send(f"🔄 WelcomeCrew: refreshed caches at {when_local} ({TIMEZONE})")
+                    except Exception:
+                        pass
+
+            print("[refresh] clan tags + sheet handles refreshed", flush=True)
+        except Exception as e:
+            print(f"[refresh] failed: {type(e).__name__}: {e}", flush=True)
+
 _pending_welcome: Dict[int, Dict[str, Any]] = {}  # thread_id -> {ticket, username, close_dt}
 _pending_promo:   Dict[int, Dict[str, Any]] = {}
 
@@ -1372,6 +1452,11 @@ async def on_message(message: discord.Message):
 @bot.event
 async def on_ready():
     print(f"Logged in as {bot.user}", flush=True)
+    # kick off the 3x/day scheduled refresh (once)
+    global _refresh_task
+    if _refresh_task is None or _refresh_task.done():
+        _refresh_task = asyncio.create_task(scheduled_refresh_loop())
+
 
 if ENABLE_WEB_SERVER:
     try:
@@ -1401,3 +1486,4 @@ else:
         _print_boot_info()
         if TOKEN: bot.run(TOKEN)
         else: print("FATAL: DISCORD_TOKEN/TOKEN not set.", flush=True)
+
