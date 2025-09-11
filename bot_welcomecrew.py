@@ -1,4 +1,6 @@
-# C1C – WelcomeCrew (v16)
+bot_welcomecrew.py
+# C1C – WelcomeCrew - v1.0
+
 # - Live watchers; notify-channel fallback (no DMs)
 # - Auto-join new threads / on-mention join
 # - Forgiving parsers; F-IT/multi-part tags; clanlist tags from column B
@@ -533,6 +535,14 @@ def dedupe_sheet(name: str, ws, has_type: bool=False) -> Tuple[int,int]:
     else: ws_index_welcome(name, ws)
     return (len(winners), deleted)
 
+# ---------- Close marker detection (forgiving) ----------
+CLOSE_RX = re.compile(r'(?i)\b(ticket)?\s*closed\b[\s:\-–—•]*\bby\b')
+
+def is_close_marker(text: str) -> bool:
+    if not text:
+        return False
+    return bool(CLOSE_RX.search(text))
+
 # ---------- Parsing + inference ----------
 WELCOME_START_RX = re.compile(r'(?i)^(?:closed[- ]*)?(\d{4})[- ]+(.+)$')
 PROMO_START_RX   = re.compile(r'(?i)^.*?(\d{4})-(.+)$')
@@ -545,10 +555,18 @@ def _aggregate_msg_text(msg: discord.Message) -> str:
     parts = [msg.content or ""]
     for e in msg.embeds or []:
         parts += [e.title or "", e.description or ""]
-        if e.author and e.author.name: parts.append(e.author.name)
+        if e.author and e.author.name:
+            parts.append(e.author.name)
         for f in e.fields or []:
             parts += [f.name or "", f.value or ""]
+        # NEW: also read footer text, many bots put "Ticket Closed by ..." here
+        try:
+            if getattr(e, "footer", None) and getattr(e.footer, "text", None):
+                parts.append(e.footer.text or "")
+        except Exception:
+            pass
     return " | ".join(parts)
+
 
 async def infer_clantag_from_thread(thread: discord.Thread) -> Optional[str]:
     if not ENABLE_INFER_TAG_FROM_THREAD:
@@ -1430,8 +1448,8 @@ async def on_message(message: discord.Message):
 
         # WELCOME watcher
         if ENABLE_LIVE_WATCH and ENABLE_LIVE_WATCH_WELCOME and _is_thread_in_parent(th, WELCOME_CHANNEL_ID):
-            text = _aggregate_msg_text(message).lower()
-            if "ticket closed by" in text:
+            text = _aggregate_msg_text(message)
+            if is_close_marker(text):
                 parsed = parse_welcome_thread_name_allow_missing(th.name or "")
                 if parsed:
                     ticket, username, tag = parsed
@@ -1459,8 +1477,8 @@ async def on_message(message: discord.Message):
 
         # PROMO watcher
         if ENABLE_LIVE_WATCH and ENABLE_LIVE_WATCH_PROMO and _is_thread_in_parent(th, PROMO_CHANNEL_ID):
-            text = _aggregate_msg_text(message).lower()
-            if "ticket closed by" in text:
+            text = _aggregate_msg_text(message)
+            if is_close_marker(text):
                 parsed = parse_promo_thread_name(th.name or "")
                 if parsed:
                     ticket, username, tag = parsed
@@ -1488,6 +1506,51 @@ async def on_message(message: discord.Message):
 
     # Always let commands run
     await bot.process_commands(message)
+
+@bot.event
+async def on_thread_update(before: discord.Thread, after: discord.Thread):
+    try:
+        if after.parent_id not in {WELCOME_CHANNEL_ID, PROMO_CHANNEL_ID}:
+            return
+
+        just_archived = (not getattr(before, "archived", False)) and getattr(after, "archived", False)
+        just_locked   = (not getattr(before, "locked", False))   and getattr(after, "locked", True)
+        if not (just_archived or just_locked):
+            return
+
+        if after.parent_id == WELCOME_CHANNEL_ID:
+            parsed = parse_welcome_thread_name_allow_missing(after.name or "")
+            scope  = "welcome"
+        else:
+            parsed = parse_promo_thread_name(after.name or "")
+            scope  = "promo"
+
+        if not parsed:
+            log_action(scope, "skip_on_update", status="name parse fail", link=thread_link(after))
+            return
+
+        ticket, username, tag = parsed
+        close_dt = await find_close_timestamp(after) or after.updated_at or after.created_at
+
+        if scope == "welcome":
+            if tag:
+                await _finalize_welcome(after, ticket, username, tag, close_dt)
+                log_action(scope, "close_detected_on_update", ticket=_fmt_ticket(ticket), username=username, clantag=tag, link=thread_link(after))
+            else:
+                _pending_welcome[after.id] = {"ticket": ticket, "username": username, "close_dt": close_dt}
+                await _prompt_for_tag(after, ticket, username, None, mode="welcome")
+                log_action(scope, "prompt_sent_on_update", ticket=_fmt_ticket(ticket), username=username, link=thread_link(after))
+        else:
+            if tag:
+                await _finalize_promo(after, ticket, username, tag, close_dt)
+                log_action(scope, "close_detected_on_update", ticket=_fmt_ticket(ticket), username=username, clantag=tag, link=thread_link(after))
+            else:
+                _pending_promo[after.id] = {"ticket": ticket, "username": username, "close_dt": close_dt}
+                await _prompt_for_tag(after, ticket, username, None, mode="promo")
+                log_action(scope, "prompt_sent_on_update", ticket=_fmt_ticket(ticket), username=username, link=thread_link(after))
+    except Exception as e:
+        print(f"on_thread_update error: {type(e).__name__}: {e}", flush=True)
+
 
 # ---------- Ready + health server ----------
 @bot.event
@@ -1527,6 +1590,7 @@ else:
         _print_boot_info()
         if TOKEN: bot.run(TOKEN)
         else: print("FATAL: DISCORD_TOKEN/TOKEN not set.", flush=True)
+
 
 
 
