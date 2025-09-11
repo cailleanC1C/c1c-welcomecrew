@@ -1,4 +1,4 @@
-bot_welcomecrew.py
+
 # C1C – WelcomeCrew - v1.0
 
 # - Live watchers; notify-channel fallback (no DMs)
@@ -1590,6 +1590,7 @@ else:
         _print_boot_info()
         if TOKEN: bot.run(TOKEN)
         else: print("FATAL: DISCORD_TOKEN/TOKEN not set.", flush=True)
+
 
 
 
