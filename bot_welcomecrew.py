@@ -1376,6 +1376,15 @@ async def on_thread_create(thread: discord.Thread):
         pass
 
 @bot.event
+async def on_command_error(ctx, error):
+    if isinstance(error, commands.CommandNotFound):
+        return  # ignore silently
+    try:
+        await ctx.reply(f"⚠️ Command error: `{type(error).__name__}: {error}`")
+    except:
+        pass
+
+@bot.event
 async def on_message(message: discord.Message):
     # Only handle thread messages for watchers (commands still processed at end)
     if isinstance(message.channel, discord.Thread):
@@ -1486,4 +1495,5 @@ else:
         _print_boot_info()
         if TOKEN: bot.run(TOKEN)
         else: print("FATAL: DISCORD_TOKEN/TOKEN not set.", flush=True)
+
 
