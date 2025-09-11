@@ -222,8 +222,40 @@ def _mk_help_embed_mobile(guild: discord.Guild | None = None) -> discord.Embed:
     return e
 
 @bot.command(name="help")
-async def help_cmd(ctx: commands.Context):
-    await ctx.reply(embed=_mk_help_embed_mobile(ctx.guild), mention_author=False)
+async def help_cmd(ctx: commands.Context, *, topic: str = None):
+    topic = (topic or "").strip().lower()
+
+    pages = {
+        "env_check": "`!env_check`\nCheck required env vars, toggles, and IDs.",
+        "sheetstatus": "`!sheetstatus`\nShow tabs, service account email, and share info.",
+        "backfill_tickets": "`!backfill_tickets`\nScan Welcome & Promo threads and log to Sheets.",
+        "backfill_details": "`!backfill_details`\nExport skipped/updated diffs as a text file.",
+        "dedupe_sheet": "`!dedupe_sheet`\nDelete duplicate tickets in both sheets.",
+        "watch_status": "`!watch_status`\nShow ON/OFF state of watchers and last 5 actions.",
+        "reload": "`!reload`\nClear cache so next call reopens Sheets fresh.",
+        "checksheet": "`!checksheet`\nRow counts for both sheets.",
+        "health": "`!health`\nShow bot latency, Sheets health, and uptime.",
+        "reboot": "`!reboot`\nSoft restart the bot.",
+        "ping": "`!ping`\nSimple bot-alive check (Pong).",
+    }
+
+    # overview help if no topic
+    if not topic:
+        return await ctx.reply(embed=_mk_help_embed_mobile(ctx.guild), mention_author=False)
+
+    txt = pages.get(topic)
+    if not txt:
+        # behave like unknown command: stay silent, log it
+        import logging
+        log = logging.getLogger("welcomecrew")
+        log.warning("Unknown help topic requested: %s", topic)
+        return
+
+    e = discord.Embed(title=f"!help {topic}", description=txt, color=EMBED_COLOR)
+    if HELP_ICON_URL:
+        e.set_thumbnail(url=HELP_ICON_URL)
+    await ctx.reply(embed=e, mention_author=False)
+
 
 @bot.tree.command(name="help", description="Show WelcomeCrew help")
 async def slash_help(interaction: discord.Interaction):
@@ -1495,5 +1527,6 @@ else:
         _print_boot_info()
         if TOKEN: bot.run(TOKEN)
         else: print("FATAL: DISCORD_TOKEN/TOKEN not set.", flush=True)
+
 
 
