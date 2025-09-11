@@ -1510,14 +1510,31 @@ async def on_message(message: discord.Message):
 @bot.event
 async def on_thread_update(before: discord.Thread, after: discord.Thread):
     try:
+        # Only watch our channels
         if after.parent_id not in {WELCOME_CHANNEL_ID, PROMO_CHANNEL_ID}:
             return
 
-        just_archived = (not getattr(before, "archived", False)) and getattr(after, "archived", False)
-        just_locked   = (not getattr(before, "locked", False))   and getattr(after, "locked", True)
+        # Use safe defaults = False (never True)
+        b_arch = bool(getattr(before, "archived", False))
+        a_arch = bool(getattr(after,  "archived", False))
+        b_lock = bool(getattr(before, "locked",   False))
+        a_lock = bool(getattr(after,  "locked",   False))
+
+        # Fire only when transitioning TO archived/locked (i.e., close)
+        just_archived = (not b_arch) and a_arch
+        just_locked   = (not b_lock) and a_lock
+
+        # If it’s a reopen (arch->false or lock->false), clear any pending prompts and bail
+        just_reopened = (b_arch and not a_arch) or (b_lock and not a_lock)
+        if just_reopened:
+            _pending_welcome.pop(after.id, None)
+            _pending_promo.pop(after.id, None)
+            return
+
         if not (just_archived or just_locked):
             return
 
+        # Parse and proceed like before
         if after.parent_id == WELCOME_CHANNEL_ID:
             parsed = parse_welcome_thread_name_allow_missing(after.name or "")
             scope  = "welcome"
@@ -1535,19 +1552,23 @@ async def on_thread_update(before: discord.Thread, after: discord.Thread):
         if scope == "welcome":
             if tag:
                 await _finalize_welcome(after, ticket, username, tag, close_dt)
-                log_action(scope, "close_detected_on_update", ticket=_fmt_ticket(ticket), username=username, clantag=tag, link=thread_link(after))
+                log_action(scope, "close_detected_on_update",
+                           ticket=_fmt_ticket(ticket), username=username, clantag=tag, link=thread_link(after))
             else:
                 _pending_welcome[after.id] = {"ticket": ticket, "username": username, "close_dt": close_dt}
                 await _prompt_for_tag(after, ticket, username, None, mode="welcome")
-                log_action(scope, "prompt_sent_on_update", ticket=_fmt_ticket(ticket), username=username, link=thread_link(after))
+                log_action(scope, "prompt_sent_on_update",
+                           ticket=_fmt_ticket(ticket), username=username, link=thread_link(after))
         else:
             if tag:
                 await _finalize_promo(after, ticket, username, tag, close_dt)
-                log_action(scope, "close_detected_on_update", ticket=_fmt_ticket(ticket), username=username, clantag=tag, link=thread_link(after))
+                log_action(scope, "close_detected_on_update",
+                           ticket=_fmt_ticket(ticket), username=username, clantag=tag, link=thread_link(after))
             else:
                 _pending_promo[after.id] = {"ticket": ticket, "username": username, "close_dt": close_dt}
                 await _prompt_for_tag(after, ticket, username, None, mode="promo")
-                log_action(scope, "prompt_sent_on_update", ticket=_fmt_ticket(ticket), username=username, link=thread_link(after))
+                log_action(scope, "prompt_sent_on_update",
+                           ticket=_fmt_ticket(ticket), username=username, link=thread_link(after))
     except Exception as e:
         print(f"on_thread_update error: {type(e).__name__}: {e}", flush=True)
 
@@ -1590,6 +1611,7 @@ else:
         _print_boot_info()
         if TOKEN: bot.run(TOKEN)
         else: print("FATAL: DISCORD_TOKEN/TOKEN not set.", flush=True)
+
 
 
 
