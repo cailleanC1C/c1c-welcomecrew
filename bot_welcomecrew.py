@@ -11,7 +11,7 @@
 # - Promo threads now also renamed to Closed-####-username-TAG
 
 import os, json, re, asyncio, time, io, random
-from datetime import datetime, timezone as _tz
+from datetime import datetime, timezone as _tz, timedelta as _td
 from typing import Optional, Tuple, Dict, Any, List
 from collections import deque
 
@@ -632,7 +632,7 @@ async def find_close_timestamp(thread: discord.Thread) -> Optional[datetime]:
     try:
         async for msg in thread.history(limit=500, oldest_first=False):
             text = _aggregate_msg_text(msg)
-            if "ticket closed by" in text.lower():
+            if is_close_marker(text):
                 return msg.created_at
     except discord.Forbidden: pass
     except Exception: pass
@@ -1377,7 +1377,7 @@ async def scheduled_refresh_loop():
             next_dt = min(today_candidates)
         else:
             h, m = times[0]
-            next_dt = (now + _tz.timedelta(days=1)).replace(hour=h, minute=m, second=0, microsecond=0)
+            next_dt = (now + _td(days=1)).replace(hour=h, minute=m, second=0, microsecond=0)
 
         await _sleep_until(next_dt)
 
@@ -1440,6 +1440,15 @@ async def on_message(message: discord.Message):
     if isinstance(message.channel, discord.Thread):
         th = message.channel
 
+        # Ignore activity on reopened (unarchived/unlocked) threads for pending prompts
+        try:
+            if th.id in _pending_welcome or th.id in _pending_promo:
+                # If the thread is no longer archived/locked, nuke pending state
+                if not getattr(th, "archived", False) and not getattr(th, "locked", False):
+                    _pending_welcome.pop(th.id, None)
+                    _pending_promo.pop(th.id, None)
+        except Exception:
+            pass
         # If mentioned, join to ensure we can speak
         if th.parent_id in {WELCOME_CHANNEL_ID, PROMO_CHANNEL_ID}:
             if bot.user and bot.user.mentioned_in(message):
@@ -1611,6 +1620,7 @@ else:
         _print_boot_info()
         if TOKEN: bot.run(TOKEN)
         else: print("FATAL: DISCORD_TOKEN/TOKEN not set.", flush=True)
+
 
 
 
