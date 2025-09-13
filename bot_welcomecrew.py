@@ -1582,48 +1582,116 @@ async def on_thread_update(before: discord.Thread, after: discord.Thread):
         print(f"on_thread_update error: {type(e).__name__}: {e}", flush=True)
 
 
-# ---------- Ready + health server ----------
-@bot.event
-async def on_ready():
-    print(f"Logged in as {bot.user}", flush=True)
-    # kick off the 3x/day scheduled refresh (once)
-    global _refresh_task
-    if _refresh_task is None or _refresh_task.done():
-        _refresh_task = asyncio.create_task(scheduled_refresh_loop())
+# ---------- Ready + health server + resilient boot ----------
 
+HEALTH_PATH = os.getenv("HEALTH_PATH", "/health")
+READY_PATH  = os.getenv("READY_PATH", "/ready")
+SELF_PING_URL = os.getenv("SELF_PING_URL", "")   # optional, e.g. your Render URL
+SELF_PING_INTERVAL_MIN = int(os.getenv("SELF_PING_INTERVAL_MIN", "9"))  # keep ≥5 to stay free-tier friendly
+
+async def _maybe_self_ping():
+    """Optional low-frequency self-ping so Render keeps the dyno warm."""
+    if not SELF_PING_URL:
+        return
+    try:
+        import aiohttp
+        while True:
+            try:
+                async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=8)) as sess:
+                    async with sess.get(SELF_PING_URL + HEALTH_PATH) as resp:
+                        await resp.text()
+            except Exception:
+                pass
+            await asyncio.sleep(SELF_PING_INTERVAL_MIN * 60)
+    except Exception:
+        # aiohttp missing or other error — skip silently
+        pass
 
 if ENABLE_WEB_SERVER:
     try:
         from aiohttp import web
-        async def _health(request): return web.Response(text="ok")
+
+        async def _health(_request): 
+            return web.Response(text="ok")
+
+        async def _ready(_request):
+            # expose discord + sheets readiness in one place
+            lat = int(getattr(bot, "latency", 0) * 1000)
+            try:
+                ws_ok = get_ws(SHEET1_NAME, HEADERS_SHEET1) is not None
+            except Exception:
+                ws_ok = False
+            body = {
+                "bot_ready": getattr(bot, "is_ready", lambda: False)(),
+                "latency_ms": lat,
+                "sheets_ok": ws_ok,
+                "uptime": uptime_str(),
+            }
+            return web.json_response(body)
+
         async def web_main():
             app = web.Application()
-            app.router.add_get("/", _health); app.router.add_get("/health", _health)
+            app.router.add_get("/", _health)
+            app.router.add_get(HEALTH_PATH, _health)
+            app.router.add_get(READY_PATH, _ready)
             port = int(os.getenv("PORT","10000"))
             runner = web.AppRunner(app); await runner.setup()
-            site = web.TCPSite(runner,"0.0.0.0",port); await site.start()
-            print(f"Health server on :{port}", flush=True)
+            site = web.TCPSite(runner, "0.0.0.0", port); await site.start()
+            print(f"Health server on :{port} (paths: {HEALTH_PATH}, {READY_PATH})", flush=True)
+
         async def start_all():
             _print_boot_info()
             if not TOKEN:
-                print("FATAL: DISCORD_TOKEN/TOKEN not set.", flush=True); raise SystemExit(2)
-            await asyncio.gather(web_main(), bot.start(TOKEN))
+                print("FATAL: DISCORD_TOKEN/TOKEN not set.", flush=True)
+                raise SystemExit(2)
+
+            # Start web server first (non-blocking) and optional self-ping
+            await web_main()
+            asyncio.create_task(_maybe_self_ping())
+
+            # Resilient bot loop: restart on crash with backoff
+            backoff = 5
+            while True:
+                try:
+                    print("[boot] starting Discord bot…", flush=True)
+                    await bot.start(TOKEN)
+                    print("[boot] bot exited normally — stopping.", flush=True)
+                    break
+                except Exception as e:
+                    print(f"[boot] bot crashed: {type(e).__name__}: {e} — retrying in {backoff}s", flush=True)
+                    await asyncio.sleep(backoff)
+                    backoff = min(backoff * 2, 60)
+
         if __name__ == "__main__":
             asyncio.run(start_all())
-    except Exception:
+
+    except Exception as e:
+        # If aiohttp import or web init fails, at least try to run the bot
+        print(f"[web] disabled/fallback due to: {type(e).__name__}: {e}", flush=True)
         if __name__ == "__main__":
             _print_boot_info()
-            if TOKEN: bot.run(TOKEN)
-            else: print("FATAL: DISCORD_TOKEN/TOKEN not set.", flush=True)
+            if TOKEN: 
+                # keep some resilience even in fallback
+                while True:
+                    try:
+                        bot.run(TOKEN)
+                        break
+                    except Exception as ex:
+                        print(f"[fallback] bot.run crashed: {ex}; retrying in 10s", flush=True)
+                        time.sleep(10)
+            else:
+                print("FATAL: DISCORD_TOKEN/TOKEN not set.", flush=True)
+
 else:
     if __name__ == "__main__":
         _print_boot_info()
-        if TOKEN: bot.run(TOKEN)
-        else: print("FATAL: DISCORD_TOKEN/TOKEN not set.", flush=True)
-
-
-
-
-
-
-
+        if TOKEN:
+            while True:
+                try:
+                    bot.run(TOKEN)
+                    break
+                except Exception as ex:
+                    print(f"[no-web] bot.run crashed: {ex}; retrying in 10s", flush=True)
+                    time.sleep(10)
+        else:
+            print("FATAL: DISCORD_TOKEN/TOKEN not set.", flush=True)
