@@ -1,4 +1,3 @@
-
 # C1C – WelcomeCrew - v1.0
 
 # - Live watchers; notify-channel fallback (no DMs)
