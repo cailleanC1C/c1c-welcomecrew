@@ -166,17 +166,9 @@ def _with_backoff(callable_fn, *a, **k):
         try:
             return callable_fn(*a, **k)
         except APIError as e:
-            es = str(e)
-            if any(code in es for code in ("429", "500", "502", "503", "504")):
+            if "429" in str(e):
                 _sleep_ms(int(delay*1000 + random.randint(0,200)))
-                delay = min(delay * 2, 8)
-                continue
-            raise
-        except Exception as e:
-            # Retry a couple of times on transient network hiccups
-            if attempt < 4:
-                _sleep_ms(int(delay*1000 + random.randint(0,200)))
-                delay = min(delay * 2, 8)
+                delay *= 2
                 continue
             raise
 
@@ -443,8 +435,22 @@ def upsert_welcome(name: str, ws, ticket: str, rowvals: List[str], st_bucket: di
             if diffs:
                 st_bucket["updated_details"].append(f"{ticket}: " + "; ".join(diffs))
             return "updated"
+        _sleep_ms(SHEETS_T
+        # Refresh index just before any insert to avoid duplicates if another row was added recently
+        idx = ws_index_welcome(name, ws)
+        if ticket in idx and idx[ticket] > 0:
+            row = idx[ticket]
+            before = _with_backoff(ws.row_values, row)
+            rng = f"A{row}:{chr(ord('A')+len(rowvals)-1)}{row}"
+            _sleep_ms(SHEETS_THROTTLE_MS)
+            _with_backoff(ws.batch_update, [{"range": rng, "values": [rowvals]}])
+            diffs = _calc_diffs(header, before, rowvals)
+            if diffs:
+                st_bucket["updated_details"].append(f"{ticket}: " + "; ".join(diffs))
+            return "updated"
         _sleep_ms(SHEETS_THROTTLE_MS)
         _with_backoff(ws.append_row, rowvals, value_input_option="RAW")
+_with_backoff(ws.append_row, rowvals, value_input_option="RAW")
         _index_simple.setdefault(name, {})[ticket] = _index_simple[name].get(ticket, -1)
         return "inserted"
     except Exception as e:
@@ -1642,8 +1648,8 @@ async def on_message(message: discord.Message):
                         await _finalize_welcome(th, ticket, username, tag, close_dt)
                     else:
                         _pending_welcome[th.id] = {"ticket": ticket, "username": username, "close_dt": close_dt}
-                        # Defer prompt until archived/locked via on_thread_update
-                        log_action("welcome", "pending_set", ticket=_fmt_ticket(ticket), username=username, link=thread_link(th))
+                        await _prompt_for_tag(th, ticket, username, message, mode="welcome")
+                        log_action("welcome", "prompt_sent", ticket=_fmt_ticket(ticket), username=username, link=thread_link(th))
             elif th.id in _pending_welcome:
                 if not message.author.bot:
                     tag = _match_tag_in_text(_aggregate_msg_text(message))
@@ -1671,8 +1677,8 @@ async def on_message(message: discord.Message):
                         await _finalize_promo(th, ticket, username, tag, close_dt)
                     else:
                         _pending_promo[th.id] = {"ticket": ticket, "username": username, "close_dt": close_dt}
-                        # Defer prompt until archived/locked via on_thread_update
-                        log_action("promo", "pending_set", ticket=_fmt_ticket(ticket), username=username, link=thread_link(th))
+                        await _prompt_for_tag(th, ticket, username, message, mode="promo")
+                        log_action("promo", "prompt_sent", ticket=_fmt_ticket(ticket), username=username, link=thread_link(th))
             elif th.id in _pending_promo:
                 if not message.author.bot:
                     tag = _match_tag_in_text(_aggregate_msg_text(message))
@@ -1738,30 +1744,20 @@ async def on_thread_update(before: discord.Thread, after: discord.Thread):
                 log_action(scope, "close_detected_on_update",
                            ticket=_fmt_ticket(ticket), username=username, clantag=tag, link=thread_link(after))
             else:
-                # Anti-duplicate: prompt only once per close window
-                info = _pending_welcome.get(after.id) or {}
-                now = datetime.utcnow().replace(tzinfo=_tz.utc)
-                last = info.get("prompted_at")
-                if (not last) or ((now - last).total_seconds() > 30):
-                    _pending_welcome[after.id] = {"ticket": ticket, "username": username, "close_dt": close_dt, "prompted_at": now}
-                    await _prompt_for_tag(after, ticket, username, None, mode="welcome")
-                    log_action(scope, "prompt_sent_on_update",
-                               ticket=_fmt_ticket(ticket), username=username, link=thread_link(after))
+                _pending_welcome[after.id] = {"ticket": ticket, "username": username, "close_dt": close_dt}
+                await _prompt_for_tag(after, ticket, username, None, mode="welcome")
+                log_action(scope, "prompt_sent_on_update",
+                           ticket=_fmt_ticket(ticket), username=username, link=thread_link(after))
         else:
             if tag:
                 await _finalize_promo(after, ticket, username, tag, close_dt)
                 log_action(scope, "close_detected_on_update",
                            ticket=_fmt_ticket(ticket), username=username, clantag=tag, link=thread_link(after))
             else:
-                # Anti-duplicate: prompt only once per close window
-                info = _pending_promo.get(after.id) or {}
-                now = datetime.utcnow().replace(tzinfo=_tz.utc)
-                last = info.get("prompted_at")
-                if (not last) or ((now - last).total_seconds() > 30):
-                    _pending_promo[after.id] = {"ticket": ticket, "username": username, "close_dt": close_dt, "prompted_at": now}
-                    await _prompt_for_tag(after, ticket, username, None, mode="promo")
-                    log_action(scope, "prompt_sent_on_update",
-                               ticket=_fmt_ticket(ticket), username=username, link=thread_link(after))
+                _pending_promo[after.id] = {"ticket": ticket, "username": username, "close_dt": close_dt}
+                await _prompt_for_tag(after, ticket, username, None, mode="promo")
+                log_action(scope, "prompt_sent_on_update",
+                           ticket=_fmt_ticket(ticket), username=username, link=thread_link(after))
     except Exception as e:
         print(f"on_thread_update error: {type(e).__name__}: {e}", flush=True)
 
