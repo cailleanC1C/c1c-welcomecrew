@@ -435,7 +435,7 @@ def upsert_welcome(name: str, ws, ticket: str, rowvals: List[str], st_bucket: di
             if diffs:
                 st_bucket["updated_details"].append(f"{ticket}: " + "; ".join(diffs))
             return "updated"
-        _sleep_ms(SHEETS_T
+        _sleep_ms(SHEETS_THROTTLE_MS)
         # Refresh index just before any insert to avoid duplicates if another row was added recently
         idx = ws_index_welcome(name, ws)
         if ticket in idx and idx[ticket] > 0:
@@ -1771,3 +1771,4 @@ async def _boot():
 
 if __name__ == "__main__":
     asyncio.run(_boot())
+
