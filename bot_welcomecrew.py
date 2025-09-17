@@ -165,10 +165,12 @@ def _with_backoff(callable_fn, *a, **k):
     for attempt in range(6):
         try:
             return callable_fn(*a, **k)
-        except APIError as e:
-            if "429" in str(e):
-                _sleep_ms(int(delay*1000 + random.randint(0,200)))
-                delay *= 2
+        except Exception as e:
+            msg = str(e).lower()
+            transient = any(tok in msg for tok in ("429", "rate", "timed out", "reset", "500", "502", "503", "504"))
+            if transient and attempt < 5:
+                _sleep_ms(int(delay * 1000 + random.randint(0, 200)))
+                delay = min(delay * 2, 8.0)
                 continue
             raise
 
@@ -1648,8 +1650,9 @@ async def on_message(message: discord.Message):
                         await _finalize_welcome(th, ticket, username, tag, close_dt)
                     else:
                         _pending_welcome[th.id] = {"ticket": ticket, "username": username, "close_dt": close_dt}
-                        await _prompt_for_tag(th, ticket, username, message, mode="welcome")
-                        log_action("welcome", "prompt_sent", ticket=_fmt_ticket(ticket), username=username, link=thread_link(th))
+                        # Defer prompt until the thread actually archives/locks (avoid duplicates/race)
+                        log_action("welcome", "pending_set", ticket=_fmt_ticket(ticket), username=username, link=thread_link(th))
+                        (th))
             elif th.id in _pending_welcome:
                 if not message.author.bot:
                     tag = _match_tag_in_text(_aggregate_msg_text(message))
@@ -1677,8 +1680,8 @@ async def on_message(message: discord.Message):
                         await _finalize_promo(th, ticket, username, tag, close_dt)
                     else:
                         _pending_promo[th.id] = {"ticket": ticket, "username": username, "close_dt": close_dt}
-                        await _prompt_for_tag(th, ticket, username, message, mode="promo")
-                        log_action("promo", "prompt_sent", ticket=_fmt_ticket(ticket), username=username, link=thread_link(th))
+                        # Defer prompt until the thread actually archives/locks (avoid duplicates/race)
+                        log_action("promo", "pending_set", ticket=_fmt_ticket(ticket), username=username, link=thread_link(th))
             elif th.id in _pending_promo:
                 if not message.author.bot:
                     tag = _match_tag_in_text(_aggregate_msg_text(message))
@@ -1745,9 +1748,16 @@ async def on_thread_update(before: discord.Thread, after: discord.Thread):
                            ticket=_fmt_ticket(ticket), username=username, clantag=tag, link=thread_link(after))
             else:
                 _pending_welcome[after.id] = {"ticket": ticket, "username": username, "close_dt": close_dt}
-                await _prompt_for_tag(after, ticket, username, None, mode="welcome")
-                log_action(scope, "prompt_sent_on_update",
-                           ticket=_fmt_ticket(ticket), username=username, link=thread_link(after))
+                # Anti-duplicate: if we already prompted very recently, skip
+                info = _pending_welcome.get(after.id, {})
+                last = info.get("prompted_at")
+                now_ts = datetime.utcnow().timestamp()
+                if (last is None) or (now_ts - last > 30):
+                    info["prompted_at"] = now_ts
+                    _pending_welcome[after.id] = info
+                    await _prompt_for_tag(after, ticket, username, None, mode="welcome")
+                    log_action(scope, "prompt_sent_on_update",
+                               ticket=_fmt_ticket(ticket), username=username, link=thread_link(after))
         else:
             if tag:
                 await _finalize_promo(after, ticket, username, tag, close_dt)
@@ -1755,9 +1765,15 @@ async def on_thread_update(before: discord.Thread, after: discord.Thread):
                            ticket=_fmt_ticket(ticket), username=username, clantag=tag, link=thread_link(after))
             else:
                 _pending_promo[after.id] = {"ticket": ticket, "username": username, "close_dt": close_dt}
-                await _prompt_for_tag(after, ticket, username, None, mode="promo")
-                log_action(scope, "prompt_sent_on_update",
-                           ticket=_fmt_ticket(ticket), username=username, link=thread_link(after))
+                info = _pending_promo.get(after.id, {})
+                last = info.get("prompted_at")
+                now_ts = datetime.utcnow().timestamp()
+                if (last is None) or (now_ts - last > 30):
+                    info["prompted_at"] = now_ts
+                    _pending_promo[after.id] = info
+                    await _prompt_for_tag(after, ticket, username, None, mode="promo")
+                    log_action(scope, "prompt_sent_on_update",
+                               ticket=_fmt_ticket(ticket), username=username, link=thread_link(after))
     except Exception as e:
         print(f"on_thread_update error: {type(e).__name__}: {e}", flush=True)
 
@@ -1771,4 +1787,5 @@ async def _boot():
 
 if __name__ == "__main__":
     asyncio.run(_boot())
+
 
