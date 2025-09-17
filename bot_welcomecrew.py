@@ -452,7 +452,6 @@ def upsert_welcome(name: str, ws, ticket: str, rowvals: List[str], st_bucket: di
             return "updated"
         _sleep_ms(SHEETS_THROTTLE_MS)
         _with_backoff(ws.append_row, rowvals, value_input_option="RAW")
-_with_backoff(ws.append_row, rowvals, value_input_option="RAW")
         _index_simple.setdefault(name, {})[ticket] = _index_simple[name].get(ticket, -1)
         return "inserted"
     except Exception as e:
@@ -1787,5 +1786,6 @@ async def _boot():
 
 if __name__ == "__main__":
     asyncio.run(_boot())
+
 
 
