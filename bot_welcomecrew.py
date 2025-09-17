@@ -247,13 +247,13 @@ async def help_cmd(ctx: commands.Context, *, topic: str = None):
         "ping": "`!ping`\nSimple bot-alive check (Pong).",
     }
 
-    # overview help if no topic
+# overview help if no topic
     if not topic:
         return await ctx.reply(embed=_mk_help_embed_mobile(ctx.guild), mention_author=False)
 
     txt = pages.get(topic)
     if not txt:
-        # behave like unknown command: stay silent, log it
+# behave like unknown command: stay silent, log it
         import logging
         log = logging.getLogger("welcomecrew")
         log.warning("Unknown help topic requested: %s", topic)
@@ -438,7 +438,7 @@ def upsert_welcome(name: str, ws, ticket: str, rowvals: List[str], st_bucket: di
                 st_bucket["updated_details"].append(f"{ticket}: " + "; ".join(diffs))
             return "updated"
         _sleep_ms(SHEETS_THROTTLE_MS)
-        # Refresh index just before any insert to avoid duplicates if another row was added recently
+# Refresh index just before any insert to avoid duplicates if another row was added recently
         idx = ws_index_welcome(name, ws)
         if ticket in idx and idx[ticket] > 0:
             row = idx[ticket]
@@ -578,7 +578,7 @@ def _aggregate_msg_text(msg: discord.Message) -> str:
             parts.append(e.author.name)
         for f in e.fields or []:
             parts += [f.name or "", f.value or ""]
-        # NEW: also read footer text, many bots put "Ticket Closed by ..." here
+# NEW: also read footer text, many bots put "Ticket Closed by ..." here
         try:
             if getattr(e, "footer", None) and getattr(e.footer, "text", None):
                 parts.append(e.footer.text or "")
@@ -832,7 +832,7 @@ async def _finalize_welcome(thread: discord.Thread, ticket: str, username: str, 
 async def _finalize_promo(thread: discord.Thread, ticket: str, username: str, clantag: str, close_dt: Optional[datetime]):
     ws = get_ws(SHEET4_NAME, HEADERS_SHEET4)
 
-    # Rename promo/move threads too (same canonical format as welcome)
+# Rename promo/move threads too (same canonical format as welcome)
     renamed = await _rename_welcome_thread_if_needed(thread, ticket, username, clantag or "")
     if renamed:
         log_action("promo", "renamed",
@@ -1300,7 +1300,7 @@ class TagPickerView(discord.ui.View):
         self.page  = 0
         self.message: Optional[discord.Message] = None
 
-        # Dropdown
+# Dropdown
         self.select = discord.ui.Select(
             placeholder=f"Choose clan tag • Page 1/{len(self.pages)}",
             min_values=1, max_values=1,
@@ -1312,7 +1312,7 @@ class TagPickerView(discord.ui.View):
         self.select.callback = _on_select
         self.add_item(self.select)
 
-        # Pager if >25 options
+# Pager if >25 options
         if len(self.pages) > 1:
             prev_btn = discord.ui.Button(label="◀ Prev", style=discord.ButtonStyle.secondary)
             next_btn = discord.ui.Button(label="Next ▶", style=discord.ButtonStyle.secondary)
@@ -1393,14 +1393,14 @@ async def on_ready():
     BOT_CONNECTED = True
     _LAST_READY_TS = _now()
     _mark_event()
-    # start watchdog once
+# start watchdog once
     try:
         if not _watchdog.is_running():
             _watchdog.start()
     except NameError:
         pass
 
-    # start the 3×/day cache refresh (idempotent)
+# start the 3×/day cache refresh (idempotent)
     global _refresh_task
     if _refresh_task is None or _refresh_task.done():
         _refresh_task = bot.loop.create_task(scheduled_refresh_loop())
@@ -1432,12 +1432,12 @@ async def _watchdog():
         except Exception:
             latency = None
 
-        # If connected but no events for >10m and latency missing/huge → likely zombied gateway
+# If connected but no events for >10m and latency missing/huge → likely zombied gateway
         if _LAST_EVENT_TS and idle_for > 600 and (latency is None or latency > 10):
             await _maybe_restart(f"zombie: no events {int(idle_for)}s, latency={latency}")
         return
 
-    # Disconnected: count real downtime since last disconnect
+# Disconnected: count real downtime since last disconnect
     global _LAST_DISCONNECT_TS
     if not _LAST_DISCONNECT_TS:
         _LAST_DISCONNECT_TS = now
@@ -1447,7 +1447,7 @@ async def _watchdog():
         await _maybe_restart(f"disconnected too long: {int(now - _LAST_DISCONNECT_TS)}s")
 
 async def _health_json(_req):
-    # Deep status: 200 if connected, 503 if disconnected, 206 if "zombie-ish"
+# Deep status: 200 if connected, 503 if disconnected, 206 if "zombie-ish"
     connected = BOT_CONNECTED
     age = _last_event_age_s()
     try:
@@ -1469,7 +1469,7 @@ async def _health_json(_req):
     return web.json_response(body, status=status)
 
 async def _health_json_ok_always(_req):
-    # Same payload as above, but **always** HTTP 200 (prevents platform flaps)
+# Same payload as above, but **always** HTTP 200 (prevents platform flaps)
     connected = BOT_CONNECTED
     age = _last_event_age_s()
     try:
@@ -1493,7 +1493,7 @@ async def start_webserver():
         await app["session"].close()
     app.on_cleanup.append(_close_session)
 
-    # If STRICT_PROBE=0 (default): / and /ready always 200 to avoid flaps
+# If STRICT_PROBE=0 (default): / and /ready always 200 to avoid flaps
     if STRICT_PROBE:
         app.router.add_get("/", _health_json)
         app.router.add_get("/ready", _health_json)
@@ -1503,7 +1503,7 @@ async def start_webserver():
         app.router.add_get("/ready", _health_json_ok_always)
         app.router.add_get("/health", _health_json_ok_always)
 
-    # Deep check for Render’s Health Check Path
+# Deep check for Render’s Health Check Path
     app.router.add_get("/healthz", _health_json)
 
     runner = web.AppRunner(app)
@@ -1528,7 +1528,7 @@ def _parse_times_csv(s: str) -> List[Tuple[int, int]]:
             out.append((h, m))
         except Exception:
             pass
-    # de-dup + sort; default to 02:00,10:00,18:00 if none valid
+# de-dup + sort; default to 02:00,10:00,18:00 if none valid
     out = sorted(set(out))
     return out or [(2, 0), (10, 0), (18, 0)]
 
@@ -1539,7 +1539,7 @@ async def _sleep_until(dt: datetime):
         await asyncio.sleep(secs)
 
 async def scheduled_refresh_loop():
-    # timezone
+# timezone
     try:
         tz = ZoneInfo(TIMEZONE) if ZoneInfo else _tz.utc
     except Exception:
@@ -1562,19 +1562,19 @@ async def scheduled_refresh_loop():
 
         await _sleep_until(next_dt)
 
-        # Do the actual refresh:
+# Do the actual refresh:
         try:
-            # force-reload clan tags (main read this bot does)
+# force-reload clan tags (main read this bot does)
             _ = _load_clan_tags(force=True)
 
-            # (Optional) warm worksheets so first write after refresh is snappy
+# (Optional) warm worksheets so first write after refresh is snappy
             try:
                 get_ws(SHEET1_NAME, HEADERS_SHEET1)
                 get_ws(SHEET4_NAME, HEADERS_SHEET4)
             except Exception:
                 pass
 
-            # Log to channel if configured
+# Log to channel if configured
             if LOG_CHANNEL_ID:
                 ch = bot.get_channel(LOG_CHANNEL_ID)
                 if isinstance(ch, (discord.TextChannel, discord.Thread)):
@@ -1599,7 +1599,7 @@ def _is_thread_in_parent(thread: discord.Thread, parent_id: int) -> bool:
 
 @bot.event
 async def on_thread_create(thread: discord.Thread):
-    # Auto-join new threads in our target channels (even if not pinged)
+# Auto-join new threads in our target channels (even if not pinged)
     try:
         if thread.parent_id in {WELCOME_CHANNEL_ID, PROMO_CHANNEL_ID}:
             await thread.join()
@@ -1617,26 +1617,26 @@ async def on_command_error(ctx, error):
 
 @bot.event
 async def on_message(message: discord.Message):
-    # Only handle thread messages for watchers (commands still processed at end)
+# Only handle thread messages for watchers (commands still processed at end)
     if isinstance(message.channel, discord.Thread):
         th = message.channel
 
-        # Ignore activity on reopened (unarchived/unlocked) threads for pending prompts
+# Ignore activity on reopened (unarchived/unlocked) threads for pending prompts
         try:
             if th.id in _pending_welcome or th.id in _pending_promo:
-                # If the thread is no longer archived/locked, nuke pending state
+# If the thread is no longer archived/locked, nuke pending state
                 if not getattr(th, "archived", False) and not getattr(th, "locked", False):
                     _pending_welcome.pop(th.id, None)
                     _pending_promo.pop(th.id, None)
         except Exception:
             pass
-        # If mentioned, join to ensure we can speak
+# If mentioned, join to ensure we can speak
         if th.parent_id in {WELCOME_CHANNEL_ID, PROMO_CHANNEL_ID}:
             if bot.user and bot.user.mentioned_in(message):
                 try: await th.join()
                 except Exception: pass
 
-        # WELCOME watcher
+# WELCOME watcher
         if ENABLE_LIVE_WATCH and ENABLE_LIVE_WATCH_WELCOME and _is_thread_in_parent(th, WELCOME_CHANNEL_ID):
             text = _aggregate_msg_text(message)
             if is_close_marker(text):
@@ -1649,9 +1649,8 @@ async def on_message(message: discord.Message):
                         await _finalize_welcome(th, ticket, username, tag, close_dt)
                     else:
                         _pending_welcome[th.id] = {"ticket": ticket, "username": username, "close_dt": close_dt}
-                        # Defer prompt until the thread actually archives/locks (avoid duplicates/race)
+# Defer prompt until the thread actually archives/locks (avoid duplicates/race)
                         log_action("welcome", "pending_set", ticket=_fmt_ticket(ticket), username=username, link=thread_link(th))
-                        (th))
             elif th.id in _pending_welcome:
                 if not message.author.bot:
                     tag = _match_tag_in_text(_aggregate_msg_text(message))
@@ -1666,7 +1665,7 @@ async def on_message(message: discord.Message):
                             except Exception:
                                 pass
 
-        # PROMO watcher
+# PROMO watcher
         if ENABLE_LIVE_WATCH and ENABLE_LIVE_WATCH_PROMO and _is_thread_in_parent(th, PROMO_CHANNEL_ID):
             text = _aggregate_msg_text(message)
             if is_close_marker(text):
@@ -1679,7 +1678,7 @@ async def on_message(message: discord.Message):
                         await _finalize_promo(th, ticket, username, tag, close_dt)
                     else:
                         _pending_promo[th.id] = {"ticket": ticket, "username": username, "close_dt": close_dt}
-                        # Defer prompt until the thread actually archives/locks (avoid duplicates/race)
+# Defer prompt until the thread actually archives/locks (avoid duplicates/race)
                         log_action("promo", "pending_set", ticket=_fmt_ticket(ticket), username=username, link=thread_link(th))
             elif th.id in _pending_promo:
                 if not message.author.bot:
@@ -1695,27 +1694,27 @@ async def on_message(message: discord.Message):
                             except Exception:
                                 pass
 
-    # Always let commands run
+# Always let commands run
     await bot.process_commands(message)
 
 @bot.event
 async def on_thread_update(before: discord.Thread, after: discord.Thread):
     try:
-        # Only watch our channels
+# Only watch our channels
         if after.parent_id not in {WELCOME_CHANNEL_ID, PROMO_CHANNEL_ID}:
             return
 
-        # Use safe defaults = False (never True)
+# Use safe defaults = False (never True)
         b_arch = bool(getattr(before, "archived", False))
         a_arch = bool(getattr(after,  "archived", False))
         b_lock = bool(getattr(before, "locked",   False))
         a_lock = bool(getattr(after,  "locked",   False))
 
-        # Fire only when transitioning TO archived/locked (i.e., close)
+# Fire only when transitioning TO archived/locked (i.e., close)
         just_archived = (not b_arch) and a_arch
         just_locked   = (not b_lock) and a_lock
 
-        # If it’s a reopen (arch->false or lock->false), clear any pending prompts and bail
+# If it’s a reopen (arch->false or lock->false), clear any pending prompts and bail
         just_reopened = (b_arch and not a_arch) or (b_lock and not a_lock)
         if just_reopened:
             _pending_welcome.pop(after.id, None)
@@ -1725,7 +1724,7 @@ async def on_thread_update(before: discord.Thread, after: discord.Thread):
         if not (just_archived or just_locked):
             return
 
-        # Parse and proceed like before
+# Parse and proceed like before
         if after.parent_id == WELCOME_CHANNEL_ID:
             parsed = parse_welcome_thread_name_allow_missing(after.name or "")
             scope  = "welcome"
@@ -1747,7 +1746,7 @@ async def on_thread_update(before: discord.Thread, after: discord.Thread):
                            ticket=_fmt_ticket(ticket), username=username, clantag=tag, link=thread_link(after))
             else:
                 _pending_welcome[after.id] = {"ticket": ticket, "username": username, "close_dt": close_dt}
-                # Anti-duplicate: if we already prompted very recently, skip
+# Anti-duplicate: if we already prompted very recently, skip
                 info = _pending_welcome.get(after.id, {})
                 last = info.get("prompted_at")
                 now_ts = datetime.utcnow().timestamp()
@@ -1776,7 +1775,6 @@ async def on_thread_update(before: discord.Thread, after: discord.Thread):
     except Exception as e:
         print(f"on_thread_update error: {type(e).__name__}: {e}", flush=True)
 
-
 # ------------------------ start -----------------------
 async def _boot():
     if not TOKEN or len(TOKEN) < 20:
@@ -1786,6 +1784,3 @@ async def _boot():
 
 if __name__ == "__main__":
     asyncio.run(_boot())
-
-
-
