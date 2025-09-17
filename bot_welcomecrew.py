@@ -10,9 +10,9 @@
 # - Promo threads now also renamed to Closed-####-username-TAG
 
 import os, json, re, asyncio, time, io, random
-from datetime import datetime, timezone as _tz, timedelta as _td
 from typing import Optional, Tuple, Dict, Any, List
 from collections import deque
+import time, sys
 
 import discord
 from discord.ext import commands
@@ -1757,3 +1757,4 @@ async def _boot():
 
 if __name__ == "__main__":
     asyncio.run(_boot())
+
