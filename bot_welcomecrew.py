@@ -1,4 +1,4 @@
-# C1C – WelcomeCrew - v1.0
+# C1C – WelcomeCrew - v1.0.0
 
 # - Live watchers; notify-channel fallback (no DMs)
 # - Auto-join new threads / on-mention join
@@ -1784,3 +1784,4 @@ async def _boot():
 
 if __name__ == "__main__":
     asyncio.run(_boot())
+
