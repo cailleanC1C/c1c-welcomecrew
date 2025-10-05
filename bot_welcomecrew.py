@@ -160,6 +160,11 @@ def _sleep_ms(ms:int):
     if ms > 0:
         time.sleep(ms/1000.0)
 
+
+async def _run_blocking(func, /, *args, **kwargs):
+    """Offload blocking calls so the Discord loop stays responsive."""
+    return await asyncio.to_thread(func, *args, **kwargs)
+
 def _with_backoff(callable_fn, *a, **k):
     delay = 0.5
     for attempt in range(6):
@@ -280,6 +285,10 @@ async def setup_hook():
         print("Slash commands synced.", flush=True)
     except Exception as e:
         print(f"Slash sync failed: {e}", flush=True)
+    try:
+        await _run_blocking(_load_clan_tags, True)
+    except Exception as e:
+        print(f"Clan tag preload failed: {e}", flush=True)
 
 # ---------- Clanlist & tag matching ----------
 _clan_tags_cache: List[str] = []
@@ -763,7 +772,7 @@ def _who_to_ping(msg: discord.Message, thread: discord.Thread) -> Optional[disco
 # ---------- Tag prompt (dropdown + fallback) ----------
 async def _prompt_for_tag(thread: discord.Thread, ticket: str, username: str,
                           msg_to_reply: Optional[discord.Message], mode: str):
-    tags = _load_clan_tags(False) or []
+    tags = await _run_blocking(_load_clan_tags, False) or []
     closer = _who_to_ping(msg_to_reply, thread)
     mention = f"{closer.mention} " if closer else ""
     content = (
@@ -819,18 +828,18 @@ async def _rename_welcome_thread_if_needed(thread: discord.Thread, ticket: str, 
     return False
 
 async def _finalize_welcome(thread: discord.Thread, ticket: str, username: str, clantag: str, close_dt: Optional[datetime]):
-    ws = get_ws(SHEET1_NAME, HEADERS_SHEET1)
+    ws = await _run_blocking(get_ws, SHEET1_NAME, HEADERS_SHEET1)
     renamed = await _rename_welcome_thread_if_needed(thread, ticket, username, clantag or "")
     if renamed:
         log_action("welcome", "renamed", ticket=_fmt_ticket(ticket), username=username, clantag=clantag or "", link=thread_link(thread))
     date_str = fmt_tz(close_dt) if close_dt else ""
     row = [_fmt_ticket(ticket), username, clantag or "", date_str]
     dummy_bucket = _new_bucket()
-    status = upsert_welcome(SHEET1_NAME, ws, ticket, row, dummy_bucket)
+    status = await _run_blocking(upsert_welcome, SHEET1_NAME, ws, ticket, row, dummy_bucket)
     log_action("welcome", "logged", ticket=_fmt_ticket(ticket), username=username, clantag=clantag or "", status=status, link=thread_link(thread))
 
 async def _finalize_promo(thread: discord.Thread, ticket: str, username: str, clantag: str, close_dt: Optional[datetime]):
-    ws = get_ws(SHEET4_NAME, HEADERS_SHEET4)
+    ws = await _run_blocking(get_ws, SHEET4_NAME, HEADERS_SHEET4)
 
 # Rename promo/move threads too (same canonical format as welcome)
     renamed = await _rename_welcome_thread_if_needed(thread, ticket, username, clantag or "")
@@ -844,7 +853,7 @@ async def _finalize_promo(thread: discord.Thread, ticket: str, username: str, cl
     date_str = fmt_tz(close_dt) if close_dt else ""
     row = [_fmt_ticket(ticket), username, clantag or "", date_str, typ, created_str]
     dummy_bucket = _new_bucket()
-    status = upsert_promo(SHEET4_NAME, ws, ticket, typ, created_str, row, dummy_bucket)
+    status = await _run_blocking(upsert_promo, SHEET4_NAME, ws, ticket, typ, created_str, row, dummy_bucket)
     log_action("promo", "logged",
                ticket=_fmt_ticket(ticket), username=username,
                clantag=clantag or "", status=status, link=thread_link(thread))
@@ -856,8 +865,8 @@ async def scan_welcome_channel(channel: discord.TextChannel, progress_cb=None):
     st = backfill_state["welcome"] = _new_report_bucket()
     if not ENABLE_WELCOME_SCAN:
         backfill_state["last_msg"] = "welcome scan disabled"; return
-    ws = get_ws(SHEET1_NAME, HEADERS_SHEET1)
-    ws_index_welcome(SHEET1_NAME, ws)
+    ws = await _run_blocking(get_ws, SHEET1_NAME, HEADERS_SHEET1)
+    await _run_blocking(ws_index_welcome, SHEET1_NAME, ws)
 
     async def handle(th: discord.Thread):
         if not backfill_state["running"]: return
@@ -900,7 +909,7 @@ async def _handle_welcome_thread(th: discord.Thread, ws, st):
     else:
         date_str = fmt_tz(dt) if dt else ""
     row = [ticket, username, clantag, date_str]
-    status = upsert_welcome(SHEET1_NAME, ws, ticket, row, st)
+    status = await _run_blocking(upsert_welcome, SHEET1_NAME, ws, ticket, row, st)
     if status == "inserted":
         st["added"] += 1; st["added_ids"].append(ticket)
     elif status == "updated":
@@ -912,8 +921,8 @@ async def scan_promo_channel(channel: discord.TextChannel, progress_cb=None):
     st = backfill_state["promo"] = _new_report_bucket()
     if not ENABLE_PROMO_SCAN:
         backfill_state["last_msg"] = "promo scan disabled"; return
-    ws = get_ws(SHEET4_NAME, HEADERS_SHEET4)
-    ws_index_promo(SHEET4_NAME, ws)
+    ws = await _run_blocking(get_ws, SHEET4_NAME, HEADERS_SHEET4)
+    await _run_blocking(ws_index_promo, SHEET4_NAME, ws)
 
     async def handle(th: discord.Thread):
         if not backfill_state["running"]: return
@@ -955,7 +964,7 @@ async def _handle_promo_thread(th: discord.Thread, ws, st):
         date_str = fmt_tz(dt_close) if dt_close else ""
     created_str = fmt_tz(th.created_at)
     row = [ticket, username, clantag, date_str, typ, created_str]
-    status = upsert_promo(SHEET4_NAME, ws, ticket, typ, created_str, row, st)
+    status = await _run_blocking(upsert_promo, SHEET4_NAME, ws, ticket, typ, created_str, row, st)
     key = f"{ticket}:{typ or 'unknown'}:{created_str}"
     if status == "inserted":
         st["added"] += 1; st["added_ids"].append(key)
@@ -1095,8 +1104,10 @@ async def cmd_ping(ctx): await ctx.reply("🏓 Pong — Live and listening.", me
 async def cmd_sheetstatus(ctx):
     email = service_account_email() or "(no service account)"
     try:
-        ws1 = get_ws(SHEET1_NAME, HEADERS_SHEET1)
-        ws4 = get_ws(SHEET4_NAME, HEADERS_SHEET4)
+        ws1, ws4 = await asyncio.gather(
+            _run_blocking(get_ws, SHEET1_NAME, HEADERS_SHEET1),
+            _run_blocking(get_ws, SHEET4_NAME, HEADERS_SHEET4),
+        )
         title = ws1.spreadsheet.title
         await ctx.reply(
             f"✅ Sheets OK: **{title}**\n• Tabs: `{SHEET1_NAME}`, `{SHEET4_NAME}`, `{CLANLIST_TAB_NAME}` (tags col {CLANLIST_TAG_COLUMN})\n• Share with: `{email}`",
@@ -1188,7 +1199,7 @@ async def cmd_backfill_details(ctx: commands.Context):
 
 @bot.command(name="clan_tags_debug")
 async def cmd_clan_tags_debug(ctx):
-    tags = _load_clan_tags(force=True)
+    tags = await _run_blocking(_load_clan_tags, True)
     norm_set = { _normalize_dashes(t).upper() for t in tags }
     has_fit = "F-IT" in norm_set
     sample = ", ".join(list(tags)[:20]) or "(none)"
@@ -1201,10 +1212,12 @@ async def cmd_clan_tags_debug(ctx):
 @cmd_enabled(ENABLE_CMD_DEDUPE)
 async def cmd_dedupe(ctx):
     try:
-        ws1 = get_ws(SHEET1_NAME, HEADERS_SHEET1)
-        ws4 = get_ws(SHEET4_NAME, HEADERS_SHEET4)
-        kept1, deleted1 = dedupe_sheet(SHEET1_NAME, ws1, has_type=False)
-        kept4, deleted4 = dedupe_sheet(SHEET4_NAME, ws4, has_type=True)
+        ws1, ws4 = await asyncio.gather(
+            _run_blocking(get_ws, SHEET1_NAME, HEADERS_SHEET1),
+            _run_blocking(get_ws, SHEET4_NAME, HEADERS_SHEET4),
+        )
+        kept1, deleted1 = await _run_blocking(dedupe_sheet, SHEET1_NAME, ws1, False)
+        kept4, deleted4 = await _run_blocking(dedupe_sheet, SHEET4_NAME, ws4, True)
         await ctx.reply(
             f"Sheet1: kept **{kept1}** unique tickets, deleted **{deleted1}** dupes.\n"
             f"Sheet4: kept **{kept4}** unique (ticket+type+created), deleted **{deleted4}** dupes.",
@@ -1226,7 +1239,7 @@ async def cmd_reload(ctx):
 async def cmd_health(ctx):
     lat = int(bot.latency*1000)
     try:
-        ws1 = get_ws(SHEET1_NAME, HEADERS_SHEET1)
+        ws1 = await _run_blocking(get_ws, SHEET1_NAME, HEADERS_SHEET1)
         ok = f"🟢 OK ({ws1.title})"
     except Exception:
         ok = "🔴 FAILED"
@@ -1236,10 +1249,16 @@ async def cmd_health(ctx):
 @cmd_enabled(ENABLE_CMD_CHECKSHEET)
 async def cmd_checksheet(ctx):
     try:
-        ws1 = get_ws(SHEET1_NAME, HEADERS_SHEET1)
-        ws4 = get_ws(SHEET4_NAME, HEADERS_SHEET4)
+        ws1, ws4 = await asyncio.gather(
+            _run_blocking(get_ws, SHEET1_NAME, HEADERS_SHEET1),
+            _run_blocking(get_ws, SHEET4_NAME, HEADERS_SHEET4),
+        )
+        rows1, rows4 = await asyncio.gather(
+            _run_blocking(ws1.col_values, 1),
+            _run_blocking(ws4.col_values, 1),
+        )
         await ctx.reply(
-            f"{SHEET1_NAME} rows: {len(ws1.col_values(1))} | {SHEET4_NAME} rows: {len(ws4.col_values(1))}",
+            f"{SHEET1_NAME} rows: {len(rows1)} | {SHEET4_NAME} rows: {len(rows4)}",
             mention_author=False
         )
     except Exception as e:
@@ -1565,12 +1584,14 @@ async def scheduled_refresh_loop():
 # Do the actual refresh:
         try:
 # force-reload clan tags (main read this bot does)
-            _ = _load_clan_tags(force=True)
+            await _run_blocking(_load_clan_tags, True)
 
 # (Optional) warm worksheets so first write after refresh is snappy
             try:
-                get_ws(SHEET1_NAME, HEADERS_SHEET1)
-                get_ws(SHEET4_NAME, HEADERS_SHEET4)
+                await asyncio.gather(
+                    _run_blocking(get_ws, SHEET1_NAME, HEADERS_SHEET1),
+                    _run_blocking(get_ws, SHEET4_NAME, HEADERS_SHEET4),
+                )
             except Exception:
                 pass
 
