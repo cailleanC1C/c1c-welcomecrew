@@ -1097,7 +1097,12 @@ async def cmd_env_check(ctx):
 
 @bot.command(name="ping")
 @cmd_enabled(ENABLE_CMD_PING)
-async def cmd_ping(ctx): await ctx.reply("🏓 Pong — Live and listening.", mention_author=False)
+async def ping(ctx):
+    # react-only liveness check
+    try:
+        await ctx.message.add_reaction("🏓")
+    except Exception:
+        pass
 
 @bot.command(name="sheetstatus")
 @cmd_enabled(ENABLE_CMD_SHEETSTATUS)
@@ -1805,4 +1810,5 @@ async def _boot():
 
 if __name__ == "__main__":
     asyncio.run(_boot())
+
 
