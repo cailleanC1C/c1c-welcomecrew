@@ -1,0 +1,3 @@
+file,path,function,start_line,end_line,complexity,loc,tags,notes
+bot_welcomecrew.py,bot_welcomecrew.py,cmd_backfill,1132,1206,17,75,"async,io","Progress loop + dual channel scans; consider extracting per-channel workers for testability."
+bot_welcomecrew.py,bot_welcomecrew.py,on_message,1645,1724,22,80,"event-handler","High branching and shared mutable state; revisit after clan-tag loader fix to trim duplication."
