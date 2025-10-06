@@ -1,0 +1,38 @@
+[
+  {
+    "title": "SEC: Gate all prefix admin commands behind Manage Server",
+    "labels": ["welcomecrew", "security", "P0"],
+    "milestone": "WC v1.0 Hardening",
+    "body": "Close privilege escalation for destructive/maintenance prefix commands.\n\n**Why**: Non-admins can trigger ops commands.\n\n**Acceptance Criteria**\n- Destructive/maintenance prefix commands (`!reboot`, `!backfill_tickets`, `!dedupe`, env/diag) fail for non-admins with a clear message; succeed for users with **Manage Server** or the designated admin role.\n- `/help` and command catalog accurately reflect gating.\n- Unit smoke: non-admin vs admin behavior verified.\n\n**Notes**\n- Align with Reminder Bot’s permission model.\n"
+  },
+  {
+    "title": "ROBUST: Make clan-tag cache refresh non-blocking + preload on worker",
+    "labels": ["welcomecrew", "robustness", "performance", "P0"],
+    "milestone": "WC v1.0 Hardening",
+    "body": "Prevent gateway starvation on cold start/TTL by moving Sheets fetch off the event loop and preloading in a worker.\n\n**Acceptance Criteria**\n- No blocking Sheets calls on the gateway loop (cold start or TTL expiry).\n- Backfill paths do not trigger on-loop reloads; preload happens via worker pool.\n- During simulated Sheets outage, message/thread handlers remain responsive.\n- Logs confirm async preload and completion.\n"
+  },
+  {
+    "title": "OBS: Add telemetry for clan-tag refresh (latency, result, count, TTL)",
+    "labels": ["welcomecrew", "observability", "P1"],
+    "milestone": "WC v1.0 Hardening",
+    "body": "Improve visibility for cache refreshes.\n\n**Acceptance Criteria**\n- Emit metrics: start/end timestamps, duration, success/failure, row count, TTL-trigger flag.\n- Log lines or metrics integrate with current health/digest surfaces.\n- Docs: where to read these numbers during incidents.\n"
+  },
+  {
+    "title": "SEC: Strengthen env/diagnostic output redaction",
+    "labels": ["welcomecrew", "security", "P1"],
+    "milestone": "WC v1.0 Hardening",
+    "body": "Harden any env/status surfaces to avoid secrets leakage.\n\n**Acceptance Criteria**\n- Print masked values only (e.g., last 2 chars max); never dump service account JSON.\n- Redaction tests for representative keys/tokens.\n- Audit existing diag commands to confirm compliance.\n"
+  },
+  {
+    "title": "DOCS: Align README/command table with new permission model",
+    "labels": ["welcomecrew", "docs", "P2"],
+    "milestone": "WC v1.0 Hardening",
+    "body": "Reduce confusion by documenting true access levels.\n\n**Acceptance Criteria**\n- README command table marks admin-gated commands precisely.\n- Inline docstrings match README; `/help` output consistent.\n- Changelog entry referencing WC v1.0 Hardening.\n"
+  },
+  {
+    "title": "PERF: Batch row deletes in dedupe path (when duplicates spike)",
+    "labels": ["welcomecrew", "performance", "P2"],
+    "milestone": "WC v1.0 Hardening",
+    "body": "Future-proof dedupe performance if dupes become common.\n\n**Acceptance Criteria**\n- Dedupe uses batched deletes/writes where supported.\n- Guarded by telemetry-driven threshold (only optimize if needed).\n- No regression in correctness; before/after timings captured.\n"
+  }
+]
