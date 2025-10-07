@@ -1,47 +1,3 @@
-name: Batch create issues
-
-on:
-  workflow_dispatch:
-    inputs:
-      file:
-        description: "Path to issues JSON or YAML inside this repo"
-        required: true
-        default: ".github/issue-batches/issues.json"
-
-jobs:
-  create:
-    runs-on: ubuntu-latest
-    permissions:
-      issues: write
-      contents: read
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Ensure jq & yq
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y jq yq
-
-      - name: Validate input file exists
-        id: pick
-        run: |
-          FILE="${{ github.event.inputs.file }}"
-          if [ ! -f "$FILE" ]; then
-            echo "File not found: $FILE" >&2
-            exit 1
-          fi
-          echo "file=$FILE" >> "$GITHUB_OUTPUT"
-
-      - name: Normalize issues file to JSON
-        run: |
-          FILE="${{ steps.pick.outputs.file }}"
-          case "$FILE" in
-            *.yml|*.yaml) yq -o=json "$FILE" > issues.json ;;
-            *.json) cp "$FILE" issues.json ;;
-            *) echo "Unsupported file type: $FILE" >&2; exit 1 ;;
-          esac
-          jq 'length' issues.json
-
       - name: Create labels and issues (GitHub API)
         uses: actions/github-script@v7
         with:
@@ -94,8 +50,11 @@ jobs:
                 });
                 core.info(`Created label: ${name}`);
               } catch (e) {
-                if (e.status === 422) core.info(`Label exists: ${name}");
-                else core.warning(`Label "${name}" error: ${e.message}`);
+                if (e.status === 422) {
+                  core.info(`Label exists: ${name}`);
+                } else {
+                  core.warning(`Label "${name}" error: ${e.message}`);
+                }
               }
             }
 
