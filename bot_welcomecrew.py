@@ -1,4 +1,4 @@
-# C1C – WelcomeCrew - v1.0.1 (patched: preserve manual data, insert-only toggle)
+# C1C – WelcomeCrew - v1.0.2 (patched: preserve manual data, insert-only toggle)
 
 import os, json, re, asyncio, time, io, random
 from datetime import datetime, timezone as _tz, timedelta as _td
@@ -1789,3 +1789,4 @@ async def _boot():
 
 if __name__ == "__main__":
     asyncio.run(_boot())
+
