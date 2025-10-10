@@ -1,4 +1,4 @@
-# C1C – WelcomeCrew v1.0.1
+# C1C – WelcomeCrew v1.0.2
 
 A Discord helper that watches **Welcome** and **Promo/Move** threads, logs them to Google Sheets, and keeps threads tidy. It never DMs; if it can’t speak in a thread it posts to a **notify** channel instead.
 
