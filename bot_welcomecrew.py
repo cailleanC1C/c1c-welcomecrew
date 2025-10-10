@@ -1,13 +1,4 @@
-# C1C – WelcomeCrew - v1.0.0
-
-# - Live watchers; notify-channel fallback (no DMs)
-# - Auto-join new threads / on-mention join
-# - Forgiving parsers; F-IT/multi-part tags; clanlist tags from column B
-# - Backfill leaves date blank if not closed; auto details attachment
-# - watch_status with last 5 actions
-# - Throttled/backoff Sheets writes; 4-digit tickets
-# - Dropdown tag picker w/ paging, timeout reload, and plain-text tag fallback
-# - Promo threads now also renamed to Closed-####-username-TAG
+# C1C – WelcomeCrew - v1.0.1 (patched: preserve manual data, insert-only toggle)
 
 import os, json, re, asyncio, time, io, random
 from datetime import datetime, timezone as _tz, timedelta as _td
@@ -33,7 +24,7 @@ import sys
 def env_bool(key: str, default: bool=True) -> bool:
     raw = (os.getenv(key) or "").strip().upper()
     if raw == "": return default
-    return raw == "ON"
+    return raw in ("ON","TRUE","1","YES")
 
 TOKEN = os.getenv("DISCORD_TOKEN") or os.getenv("TOKEN") or ""
 WELCOME_CHANNEL_ID = int(os.getenv("WELCOME_CHANNEL_ID", "0"))
@@ -44,13 +35,17 @@ SHEET1_NAME        = os.getenv("SHEET1_NAME", "Sheet1")
 SHEET4_NAME        = os.getenv("SHEET4_NAME", "Sheet4")
 CLANLIST_TAB_NAME  = os.getenv("CLANLIST_TAB_NAME", "clanlist")
 CLANLIST_TAG_COLUMN = int(os.getenv("CLANLIST_TAG_COLUMN", "2"))  # 1-based; default B
+
 # Scheduled refresh config
 REFRESH_TIMES = os.getenv("REFRESH_TIMES", "02:00,10:00,18:00")  # 24h times, comma-separated
 CLAN_TAGS_CACHE_TTL_SEC = int(os.getenv("CLAN_TAGS_CACHE_TTL_SEC", "28800"))  # 8h default
 LOG_CHANNEL_ID = int(os.getenv("LOG_CHANNEL_ID", "0"))  # optional: where to post "refreshed" pings
 
-
 SHEETS_THROTTLE_MS = int(os.getenv("SHEETS_THROTTLE_MS", "200"))
+
+# NEW: safety toggles
+PRESERVE_EXISTING_NONEMPTY = env_bool("PRESERVE_EXISTING_NONEMPTY", True)
+INSERT_ONLY                = env_bool("INSERT_ONLY", False)
 
 # Feature toggles (commands / scans)
 ENABLE_INFER_TAG_FROM_THREAD = env_bool("ENABLE_INFER_TAG_FROM_THREAD", True)
@@ -149,6 +144,7 @@ def get_ws(name: str, want_headers: List[str]):
         try:
             head = ws.row_values(1)
             if [h.strip().lower() for h in head] != [h.strip().lower() for h in want_headers]:
+                # fix gspread warning by using named args
                 ws.update(range_name="A1", values=[want_headers])
         except Exception:
             pass
@@ -159,7 +155,6 @@ def get_ws(name: str, want_headers: List[str]):
 def _sleep_ms(ms:int):
     if ms > 0:
         time.sleep(ms/1000.0)
-
 
 async def _run_blocking(func, /, *args, **kwargs):
     """Offload blocking calls so the Discord loop stays responsive."""
@@ -220,6 +215,7 @@ def _mk_help_embed_mobile(guild: discord.Guild | None = None) -> discord.Embed:
         ("!checksheet",       "sheet row counts"),
         ("!health",           "bot & Sheets health"),
         ("!reboot",           "soft restart"),
+        ("!ping",             "simple liveness reaction"),
     ]
     commands_lines = "\n".join([f"🔹 `{cmd}`\n  → {desc}" for cmd, desc in commands_pairs])
     e.add_field(name="Commands — Admin & Maintenance", value=commands_lines, inline=False)
@@ -252,13 +248,11 @@ async def help_cmd(ctx: commands.Context, *, topic: str = None):
         "ping": "`!ping`\nSimple bot-alive check (Pong).",
     }
 
-# overview help if no topic
     if not topic:
         return await ctx.reply(embed=_mk_help_embed_mobile(ctx.guild), mention_author=False)
 
     txt = pages.get(topic)
     if not txt:
-# behave like unknown command: stay silent, log it
         import logging
         log = logging.getLogger("welcomecrew")
         log.warning("Unknown help topic requested: %s", topic)
@@ -297,7 +291,6 @@ _last_clan_fetch = 0.0
 _tag_regex_cache = None
 
 def _normalize_dashes(s: str) -> str:
-    # en/em/figure hyphens -> ASCII '-'
     return re.sub(r"[\u2010\u2011\u2012\u2013\u2014\u2015]", "-", s or "")
 
 def _fmt_ticket(s: str) -> str:
@@ -353,10 +346,6 @@ def _match_tag_in_text(text: str) -> Optional[str]:
     return m.group(0).upper() if m else None
 
 def _pick_tag_by_suffix(remainder: str, known_tags: List[str]) -> Optional[Tuple[str, str]]:
-    """
-    Try to find a '-TAG' suffix where TAG is in known_tags.
-    Supports multi-segment tags like 'F-IT'. Checks last 1..3 segments.
-    """
     s = _normalize_dashes(remainder).strip()
     parts = [p for p in s.split("-") if p != ""]
     if not parts:
@@ -414,6 +403,15 @@ def _calc_diffs(header: List[str], before: List[str], after: List[str]) -> List[
             diffs.append(f"{col}: '{old}' → '{new}'")
     return diffs
 
+# ---------- Safety merge helper ----------
+def _merge_preserve_nonempty(before: List[str], incoming: List[str]) -> List[str]:
+    # extend both to same length
+    L = max(len(before), len(incoming))
+    b = (before + [""] * (L - len(before)))[:L]
+    a = (incoming + [""] * (L - len(incoming)))[:L]
+    # if incoming empty, keep before cell
+    return [ (a[i] if a[i] != "" else b[i]) for i in range(L) ]
+
 # ---------- Backfill state ----------
 def _new_bucket():
     return {
@@ -436,29 +434,39 @@ def upsert_welcome(name: str, ws, ticket: str, rowvals: List[str], st_bucket: di
     idx = _index_simple.get(name) or ws_index_welcome(name, ws)
     header = HEADERS_SHEET1
     try:
+        # UPDATE path
         if ticket in idx and idx[ticket] > 0:
+            if INSERT_ONLY:
+                return "skipped-existing"
             row = idx[ticket]
             before = _with_backoff(ws.row_values, row)
-            rng = f"A{row}:{chr(ord('A')+len(rowvals)-1)}{row}"
+            merged = _merge_preserve_nonempty(before, rowvals) if PRESERVE_EXISTING_NONEMPTY else rowvals
+            rng = f"A{row}:{chr(ord('A')+len(merged)-1)}{row}"
             _sleep_ms(SHEETS_THROTTLE_MS)
-            _with_backoff(ws.batch_update, [{"range": rng, "values": [rowvals]}])
-            diffs = _calc_diffs(header, before, rowvals)
+            _with_backoff(ws.batch_update, [{"range": rng, "values": [merged]}])
+            diffs = _calc_diffs(header, before, merged)
             if diffs:
                 st_bucket["updated_details"].append(f"{ticket}: " + "; ".join(diffs))
             return "updated"
+
+        # REINDEX then UPDATE if found
         _sleep_ms(SHEETS_THROTTLE_MS)
-# Refresh index just before any insert to avoid duplicates if another row was added recently
         idx = ws_index_welcome(name, ws)
         if ticket in idx and idx[ticket] > 0:
+            if INSERT_ONLY:
+                return "skipped-existing"
             row = idx[ticket]
             before = _with_backoff(ws.row_values, row)
-            rng = f"A{row}:{chr(ord('A')+len(rowvals)-1)}{row}"
+            merged = _merge_preserve_nonempty(before, rowvals) if PRESERVE_EXISTING_NONEMPTY else rowvals
+            rng = f"A{row}:{chr(ord('A')+len(merged)-1)}{row}"
             _sleep_ms(SHEETS_THROTTLE_MS)
-            _with_backoff(ws.batch_update, [{"range": rng, "values": [rowvals]}])
-            diffs = _calc_diffs(header, before, rowvals)
+            _with_backoff(ws.batch_update, [{"range": rng, "values": [merged]}])
+            diffs = _calc_diffs(header, before, merged)
             if diffs:
                 st_bucket["updated_details"].append(f"{ticket}: " + "; ".join(diffs))
             return "updated"
+
+        # INSERT path
         _sleep_ms(SHEETS_THROTTLE_MS)
         _with_backoff(ws.append_row, rowvals, value_input_option="RAW")
         _index_simple.setdefault(name, {})[ticket] = _index_simple[name].get(ticket, -1)
@@ -490,27 +498,38 @@ def upsert_promo(name: str, ws, ticket: str, typ: str, created_str: str, rowvals
     idx = _index_promo.get(name) or ws_index_promo(name, ws)
     header = HEADERS_SHEET4
     try:
+        # UPDATE by exact composite key
         if key in idx:
+            if INSERT_ONLY:
+                return "skipped-existing"
             row = idx[key]
             before = _with_backoff(ws.row_values, row)
-            rng = f"A{row}:{chr(ord('A')+len(rowvals)-1)}{row}"
+            merged = _merge_preserve_nonempty(before, rowvals) if PRESERVE_EXISTING_NONEMPTY else rowvals
+            rng = f"A{row}:{chr(ord('A')+len(merged)-1)}{row}"
             _sleep_ms(SHEETS_THROTTLE_MS)
-            _with_backoff(ws.batch_update, [{"range": rng, "values": [rowvals]}])
-            diffs = _calc_diffs(header, before, rowvals)
+            _with_backoff(ws.batch_update, [{"range": rng, "values": [merged]}])
+            diffs = _calc_diffs(header, before, merged)
             if diffs:
                 st_bucket["updated_details"].append(f"{ticket}:{typ}:{created_str}: " + "; ".join(diffs))
             return "updated"
+
+        # UPDATE by (ticket + type) pair if created differs
         rpair = _find_promo_row_pair(ws, ticket, typ)
         if rpair:
+            if INSERT_ONLY:
+                return "skipped-existing"
             before = _with_backoff(ws.row_values, rpair)
-            rng = f"A{rpair}:{chr(ord('A')+len(rowvals)-1)}{rpair}"
+            merged = _merge_preserve_nonempty(before, rowvals) if PRESERVE_EXISTING_NONEMPTY else rowvals
+            rng = f"A{rpair}:{chr(ord('A')+len(merged)-1)}{rpair}"
             _sleep_ms(SHEETS_THROTTLE_MS)
-            _with_backoff(ws.batch_update, [{"range": rng, "values": [rowvals]}])
+            _with_backoff(ws.batch_update, [{"range": rng, "values": [merged]}])
             ws_index_promo(name, ws)
-            diffs = _calc_diffs(header, before, rowvals)
+            diffs = _calc_diffs(header, before, merged)
             if diffs:
                 st_bucket["updated_details"].append(f"{ticket}:{typ}:{created_str}: " + "; ".join(diffs))
             return "updated"
+
+        # INSERT
         _sleep_ms(SHEETS_THROTTLE_MS)
         _with_backoff(ws.append_row, rowvals, value_input_option="RAW")
         ws_index_promo(name, ws)
@@ -587,14 +606,12 @@ def _aggregate_msg_text(msg: discord.Message) -> str:
             parts.append(e.author.name)
         for f in e.fields or []:
             parts += [f.name or "", f.value or ""]
-# NEW: also read footer text, many bots put "Ticket Closed by ..." here
         try:
             if getattr(e, "footer", None) and getattr(e.footer, "text", None):
                 parts.append(e.footer.text or "")
         except Exception:
             pass
     return " | ".join(parts)
-
 
 async def infer_clantag_from_thread(thread: discord.Thread) -> Optional[str]:
     if not ENABLE_INFER_TAG_FROM_THREAD:
@@ -805,10 +822,6 @@ async def _prompt_for_tag(thread: discord.Thread, ticket: str, username: str,
 
 # ---------- Finalizers (log + rename) ----------
 async def _rename_welcome_thread_if_needed(thread: discord.Thread, ticket: str, username: str, clantag: str) -> bool:
-    """
-    Ensure threads are named exactly: Closed-####-username-TAG
-    (keeps a single 'Closed-' prefix; avoids double-prefixing)
-    """
     try:
         core = f"{_fmt_ticket(ticket)}-{username}-{clantag}".strip("-")
         desired = f"Closed-{core}"
@@ -840,8 +853,6 @@ async def _finalize_welcome(thread: discord.Thread, ticket: str, username: str, 
 
 async def _finalize_promo(thread: discord.Thread, ticket: str, username: str, clantag: str, close_dt: Optional[datetime]):
     ws = await _run_blocking(get_ws, SHEET4_NAME, HEADERS_SHEET4)
-
-# Rename promo/move threads too (same canonical format as welcome)
     renamed = await _rename_welcome_thread_if_needed(thread, ticket, username, clantag or "")
     if renamed:
         log_action("promo", "renamed",
@@ -1053,6 +1064,8 @@ async def cmd_env_check(ctx):
         "POST_BACKFILL_SUMMARY": POST_BACKFILL_SUMMARY,
         "REQUIRE_CLOSE_MARKER_WELCOME": REQUIRE_CLOSE_MARKER_WELCOME,
         "REQUIRE_CLOSE_MARKER_PROMO": REQUIRE_CLOSE_MARKER_PROMO,
+        "PRESERVE_EXISTING_NONEMPTY": PRESERVE_EXISTING_NONEMPTY,
+        "INSERT_ONLY": INSERT_ONLY,
     }
 
     lines = []
@@ -1098,7 +1111,6 @@ async def cmd_env_check(ctx):
 @bot.command(name="ping")
 @cmd_enabled(ENABLE_CMD_PING)
 async def ping(ctx):
-    # react-only liveness check
     try:
         await ctx.message.add_reaction("🏓")
     except Exception:
@@ -1324,7 +1336,6 @@ class TagPickerView(discord.ui.View):
         self.page  = 0
         self.message: Optional[discord.Message] = None
 
-# Dropdown
         self.select = discord.ui.Select(
             placeholder=f"Choose clan tag • Page 1/{len(self.pages)}",
             min_values=1, max_values=1,
@@ -1336,7 +1347,6 @@ class TagPickerView(discord.ui.View):
         self.select.callback = _on_select
         self.add_item(self.select)
 
-# Pager if >25 options
         if len(self.pages) > 1:
             prev_btn = discord.ui.Button(label="◀ Prev", style=discord.ButtonStyle.secondary)
             next_btn = discord.ui.Button(label="Next ▶", style=discord.ButtonStyle.secondary)
@@ -1381,7 +1391,6 @@ class TagPickerView(discord.ui.View):
         )
 
     async def on_timeout(self):
-        """Expire quietly, offer reload, suggest typing the tag. No re-ping."""
         pending = (_pending_welcome if self.mode == "welcome" else _pending_promo)
         if self.thread.id not in pending:
             return
@@ -1417,18 +1426,15 @@ async def on_ready():
     BOT_CONNECTED = True
     _LAST_READY_TS = _now()
     _mark_event()
-# start watchdog once
     try:
         if not _watchdog.is_running():
             _watchdog.start()
     except NameError:
         pass
 
-# start the 3×/day cache refresh (idempotent)
     global _refresh_task
     if _refresh_task is None or _refresh_task.done():
         _refresh_task = bot.loop.create_task(scheduled_refresh_loop())
-
 
 @bot.event
 async def on_disconnect():
@@ -1456,12 +1462,10 @@ async def _watchdog():
         except Exception:
             latency = None
 
-# If connected but no events for >10m and latency missing/huge → likely zombied gateway
         if _LAST_EVENT_TS and idle_for > 600 and (latency is None or latency > 10):
             await _maybe_restart(f"zombie: no events {int(idle_for)}s, latency={latency}")
         return
 
-# Disconnected: count real downtime since last disconnect
     global _LAST_DISCONNECT_TS
     if not _LAST_DISCONNECT_TS:
         _LAST_DISCONNECT_TS = now
@@ -1471,7 +1475,6 @@ async def _watchdog():
         await _maybe_restart(f"disconnected too long: {int(now - _LAST_DISCONNECT_TS)}s")
 
 async def _health_json(_req):
-# Deep status: 200 if connected, 503 if disconnected, 206 if "zombie-ish"
     connected = BOT_CONNECTED
     age = _last_event_age_s()
     try:
@@ -1493,7 +1496,6 @@ async def _health_json(_req):
     return web.json_response(body, status=status)
 
 async def _health_json_ok_always(_req):
-# Same payload as above, but **always** HTTP 200 (prevents platform flaps)
     connected = BOT_CONNECTED
     age = _last_event_age_s()
     try:
@@ -1517,7 +1519,6 @@ async def start_webserver():
         await app["session"].close()
     app.on_cleanup.append(_close_session)
 
-# If STRICT_PROBE=0 (default): / and /ready always 200 to avoid flaps
     if STRICT_PROBE:
         app.router.add_get("/", _health_json)
         app.router.add_get("/ready", _health_json)
@@ -1527,7 +1528,6 @@ async def start_webserver():
         app.router.add_get("/ready", _health_json_ok_always)
         app.router.add_get("/health", _health_json_ok_always)
 
-# Deep check for Render’s Health Check Path
     app.router.add_get("/healthz", _health_json)
 
     runner = web.AppRunner(app)
@@ -1552,7 +1552,6 @@ def _parse_times_csv(s: str) -> List[Tuple[int, int]]:
             out.append((h, m))
         except Exception:
             pass
-# de-dup + sort; default to 02:00,10:00,18:00 if none valid
     out = sorted(set(out))
     return out or [(2, 0), (10, 0), (18, 0)]
 
@@ -1563,7 +1562,6 @@ async def _sleep_until(dt: datetime):
         await asyncio.sleep(secs)
 
 async def scheduled_refresh_loop():
-# timezone
     try:
         tz = ZoneInfo(TIMEZONE) if ZoneInfo else _tz.utc
     except Exception:
@@ -1586,12 +1584,8 @@ async def scheduled_refresh_loop():
 
         await _sleep_until(next_dt)
 
-# Do the actual refresh:
         try:
-# force-reload clan tags (main read this bot does)
             await _run_blocking(_load_clan_tags, True)
-
-# (Optional) warm worksheets so first write after refresh is snappy
             try:
                 await asyncio.gather(
                     _run_blocking(get_ws, SHEET1_NAME, HEADERS_SHEET1),
@@ -1600,7 +1594,6 @@ async def scheduled_refresh_loop():
             except Exception:
                 pass
 
-# Log to channel if configured
             if LOG_CHANNEL_ID:
                 ch = bot.get_channel(LOG_CHANNEL_ID)
                 if isinstance(ch, (discord.TextChannel, discord.Thread)):
@@ -1614,7 +1607,7 @@ async def scheduled_refresh_loop():
         except Exception as e:
             print(f"[refresh] failed: {type(e).__name__}: {e}", flush=True)
 
-_pending_welcome: Dict[int, Dict[str, Any]] = {}  # thread_id -> {ticket, username, close_dt}
+_pending_welcome: Dict[int, Dict[str, Any]] = {}
 _pending_promo:   Dict[int, Dict[str, Any]] = {}
 
 def _is_thread_in_parent(thread: discord.Thread, parent_id: int) -> bool:
@@ -1625,7 +1618,6 @@ def _is_thread_in_parent(thread: discord.Thread, parent_id: int) -> bool:
 
 @bot.event
 async def on_thread_create(thread: discord.Thread):
-# Auto-join new threads in our target channels (even if not pinged)
     try:
         if thread.parent_id in {WELCOME_CHANNEL_ID, PROMO_CHANNEL_ID}:
             await thread.join()
@@ -1635,7 +1627,7 @@ async def on_thread_create(thread: discord.Thread):
 @bot.event
 async def on_command_error(ctx, error):
     if isinstance(error, commands.CommandNotFound):
-        return  # ignore silently
+        return
     try:
         await ctx.reply(f"⚠️ Command error: `{type(error).__name__}: {error}`")
     except:
@@ -1643,26 +1635,22 @@ async def on_command_error(ctx, error):
 
 @bot.event
 async def on_message(message: discord.Message):
-# Only handle thread messages for watchers (commands still processed at end)
     if isinstance(message.channel, discord.Thread):
         th = message.channel
 
-# Ignore activity on reopened (unarchived/unlocked) threads for pending prompts
         try:
             if th.id in _pending_welcome or th.id in _pending_promo:
-# If the thread is no longer archived/locked, nuke pending state
                 if not getattr(th, "archived", False) and not getattr(th, "locked", False):
                     _pending_welcome.pop(th.id, None)
                     _pending_promo.pop(th.id, None)
         except Exception:
             pass
-# If mentioned, join to ensure we can speak
         if th.parent_id in {WELCOME_CHANNEL_ID, PROMO_CHANNEL_ID}:
             if bot.user and bot.user.mentioned_in(message):
                 try: await th.join()
                 except Exception: pass
 
-# WELCOME watcher
+        # WELCOME watcher
         if ENABLE_LIVE_WATCH and ENABLE_LIVE_WATCH_WELCOME and _is_thread_in_parent(th, WELCOME_CHANNEL_ID):
             text = _aggregate_msg_text(message)
             if is_close_marker(text):
@@ -1675,7 +1663,6 @@ async def on_message(message: discord.Message):
                         await _finalize_welcome(th, ticket, username, tag, close_dt)
                     else:
                         _pending_welcome[th.id] = {"ticket": ticket, "username": username, "close_dt": close_dt}
-# Defer prompt until the thread actually archives/locks (avoid duplicates/race)
                         log_action("welcome", "pending_set", ticket=_fmt_ticket(ticket), username=username, link=thread_link(th))
             elif th.id in _pending_welcome:
                 if not message.author.bot:
@@ -1691,7 +1678,7 @@ async def on_message(message: discord.Message):
                             except Exception:
                                 pass
 
-# PROMO watcher
+        # PROMO watcher
         if ENABLE_LIVE_WATCH and ENABLE_LIVE_WATCH_PROMO and _is_thread_in_parent(th, PROMO_CHANNEL_ID):
             text = _aggregate_msg_text(message)
             if is_close_marker(text):
@@ -1704,7 +1691,6 @@ async def on_message(message: discord.Message):
                         await _finalize_promo(th, ticket, username, tag, close_dt)
                     else:
                         _pending_promo[th.id] = {"ticket": ticket, "username": username, "close_dt": close_dt}
-# Defer prompt until the thread actually archives/locks (avoid duplicates/race)
                         log_action("promo", "pending_set", ticket=_fmt_ticket(ticket), username=username, link=thread_link(th))
             elif th.id in _pending_promo:
                 if not message.author.bot:
@@ -1720,27 +1706,22 @@ async def on_message(message: discord.Message):
                             except Exception:
                                 pass
 
-# Always let commands run
     await bot.process_commands(message)
 
 @bot.event
 async def on_thread_update(before: discord.Thread, after: discord.Thread):
     try:
-# Only watch our channels
         if after.parent_id not in {WELCOME_CHANNEL_ID, PROMO_CHANNEL_ID}:
             return
 
-# Use safe defaults = False (never True)
         b_arch = bool(getattr(before, "archived", False))
         a_arch = bool(getattr(after,  "archived", False))
         b_lock = bool(getattr(before, "locked",   False))
         a_lock = bool(getattr(after,  "locked",   False))
 
-# Fire only when transitioning TO archived/locked (i.e., close)
         just_archived = (not b_arch) and a_arch
         just_locked   = (not b_lock) and a_lock
 
-# If it’s a reopen (arch->false or lock->false), clear any pending prompts and bail
         just_reopened = (b_arch and not a_arch) or (b_lock and not a_lock)
         if just_reopened:
             _pending_welcome.pop(after.id, None)
@@ -1750,7 +1731,6 @@ async def on_thread_update(before: discord.Thread, after: discord.Thread):
         if not (just_archived or just_locked):
             return
 
-# Parse and proceed like before
         if after.parent_id == WELCOME_CHANNEL_ID:
             parsed = parse_welcome_thread_name_allow_missing(after.name or "")
             scope  = "welcome"
@@ -1772,7 +1752,6 @@ async def on_thread_update(before: discord.Thread, after: discord.Thread):
                            ticket=_fmt_ticket(ticket), username=username, clantag=tag, link=thread_link(after))
             else:
                 _pending_welcome[after.id] = {"ticket": ticket, "username": username, "close_dt": close_dt}
-# Anti-duplicate: if we already prompted very recently, skip
                 info = _pending_welcome.get(after.id, {})
                 last = info.get("prompted_at")
                 now_ts = datetime.utcnow().timestamp()
@@ -1810,6 +1789,3 @@ async def _boot():
 
 if __name__ == "__main__":
     asyncio.run(_boot())
-
-
-
