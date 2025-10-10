@@ -149,7 +149,7 @@ def get_ws(name: str, want_headers: List[str]):
         try:
             head = ws.row_values(1)
             if [h.strip().lower() for h in head] != [h.strip().lower() for h in want_headers]:
-                ws.update("A1", [want_headers])
+                ws.update(range_name="A1", values=[want_headers])
         except Exception:
             pass
     _ws_cache[name] = ws
@@ -1810,5 +1810,6 @@ async def _boot():
 
 if __name__ == "__main__":
     asyncio.run(_boot())
+
 
 
