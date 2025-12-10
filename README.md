@@ -123,12 +123,12 @@ All commands are prefix (`!…`). A minimal slash command `/help` is also provid
 
 * Watchdog checks every `WATCHDOG_CHECK_SEC` (default 60s):
 
-  * If connected but no socket activity for >10m and latency is bad → restart.
-  * If disconnected > `WATCHDOG_MAX_DISCONNECT_SEC` (default 10m) → restart.
+  * If connected but no socket activity for >`WATCHDOG_ZOMBIE_SEC` (default 600s) **and** latency is bad (`WATCHDOG_LATENCY_SEC`, default 10s) → restart.
+  * If disconnected >`WATCHDOG_DISCONNECT_AGE_SEC` (default 600s; legacy alias `WATCHDOG_MAX_DISCONNECT_SEC`) → restart.
 * Web server:
 
   * `/` and `/ready` return **200** by default (or deep status when `STRICT_PROBE=1`).
-  * `/healthz` always returns deep status (200/206/503).
+  * `/healthz` always returns deep status (200/206/503). When connected but idle/slow you will see `206` and `connected: true`.
 
 ---
 

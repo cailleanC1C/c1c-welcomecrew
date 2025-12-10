@@ -1,15 +1,16 @@
 # Repository Documentation Map
 
-_Last updated: 2025-10-08_
+_Last updated: 2025-12-10_
 
 ## Global Docs
 - **Purpose**: Provide organization-wide engineering guardrails, development workflows, and supporting references.
 - **Location pattern**: `docs/*.md`
 - **Naming convention**: Uppercase snake-case filenames (e.g., `ENGINEERING.md`).
 - **Create when**: Introducing or revising global processes, onboarding guidance, or top-level handbooks.
-- **Current files (2)**:
+- **Current files (3)**:
   - `docs/DOCS_GLOSSARY.md` — Definitions for guardrails terminology.
   - `docs/DOCS_MAP.md` — This navigational index of documentation assets.
+  - `docs/ops/Config.md` — Watchdog and health configuration guide for WelcomeCrew.
 
 ## Architectural Decision Records (ADRs)
 - **Purpose**: Capture significant architectural and process decisions with rationale and status.
