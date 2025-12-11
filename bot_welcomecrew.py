@@ -15,7 +15,7 @@ try:
 except Exception:
     ZoneInfo = None
 
-from aiohttp import web, ClientSession
+from aiohttp import web, ClientSession, ClientTimeout
 from discord.ext import tasks
 import sys
 
@@ -696,6 +696,11 @@ WATCHDOG_DISCONNECT_AGE_SEC = int(os.getenv(
 ))
 WATCHDOG_LATENCY_SEC = float(os.getenv("WATCHDOG_LATENCY_SEC", "10"))
 
+# Keepalive ping config (matchmaker-style)
+KEEPALIVE_PING_URL = os.getenv("KEEPALIVE_PING_URL", "").strip()
+KEEPALIVE_INTERVAL_SEC = int(os.getenv("KEEPALIVE_INTERVAL_SEC", "300"))
+KEEPALIVE_TIMEOUT_SEC = int(os.getenv("KEEPALIVE_TIMEOUT_SEC", "10"))
+
 def _now() -> float: return time.time()
 
 
@@ -740,6 +745,9 @@ class _Heartbeat:
 
 
 _hb = _Heartbeat()
+
+# Track keepalive task so we don't spawn duplicates on reconnects.
+_KEEPALIVE_TASK: Optional[asyncio.Task] = None
 
 def _mark_event() -> None:
     _hb.note_event()
@@ -1464,7 +1472,7 @@ async def on_resumed():
 
 @bot.event
 async def on_ready():
-    global _LAST_READY_TS
+    global _LAST_READY_TS, _KEEPALIVE_TASK
     _hb.note_ready()
     _LAST_READY_TS = _now()
     try:
@@ -1472,6 +1480,10 @@ async def on_ready():
             _watchdog.start()
     except NameError:
         pass
+
+    # Start keepalive ping loop once per process (mirrors Matchmaker behaviour).
+    if KEEPALIVE_PING_URL and (_KEEPALIVE_TASK is None or _KEEPALIVE_TASK.done()):
+        _KEEPALIVE_TASK = bot.loop.create_task(_keepalive_ping_loop())
 
     global _refresh_task
     if _refresh_task is None or _refresh_task.done():
@@ -1500,6 +1512,25 @@ def _get_latency_s() -> float | None:
         return float(latency) if latency is not None else None
     except Exception:
         return None
+
+
+async def _keepalive_ping_loop():
+    """
+    Periodically ping KEEPALIVE_PING_URL so Render sees HTTP activity.
+    Mirrors the Matchmaker keepalive behaviour.
+    """
+    if not KEEPALIVE_PING_URL:
+        return
+
+    timeout = ClientTimeout(total=KEEPALIVE_TIMEOUT_SEC)
+    async with ClientSession(timeout=timeout) as session:
+        while True:
+            try:
+                async with session.get(KEEPALIVE_PING_URL) as resp:
+                    print(f"[keepalive] ping {KEEPALIVE_PING_URL} -> {resp.status}", flush=True)
+            except Exception as e:
+                print(f"[keepalive] ping failed: {type(e).__name__}: {e}", flush=True)
+            await asyncio.sleep(max(1, KEEPALIVE_INTERVAL_SEC))
 
 
 @tasks.loop(seconds=WATCHDOG_CHECK_SEC)
