@@ -66,6 +66,10 @@ STARTUP_MAX_RETRIES       = int(os.getenv("STARTUP_MAX_RETRIES", "8"))
 STARTUP_BACKOFF_BASE_SEC  = float(os.getenv("STARTUP_BACKOFF_BASE_SEC", "30"))
 STARTUP_BACKOFF_CAP_SEC   = float(os.getenv("STARTUP_BACKOFF_CAP_SEC", "900"))
 STARTUP_JITTER_SEC        = float(os.getenv("STARTUP_JITTER_SEC", "5"))
+WATCHDOG_MIN_RESTART_INTERVAL_SEC = float(os.getenv("WATCHDOG_MIN_RESTART_INTERVAL_SEC", "120"))
+WATCHDOG_RESTART_BACKOFF_BASE_SEC = float(os.getenv("WATCHDOG_RESTART_BACKOFF_BASE_SEC", "60"))
+WATCHDOG_RESTART_BACKOFF_CAP_SEC  = float(os.getenv("WATCHDOG_RESTART_BACKOFF_CAP_SEC", "900"))
+WATCHDOG_RESTART_JITTER_SEC       = float(os.getenv("WATCHDOG_RESTART_JITTER_SEC", "10"))
 
 # Live watchers
 ENABLE_LIVE_WATCH          = env_bool("ENABLE_LIVE_WATCH", True)
@@ -1479,11 +1483,18 @@ async def on_resumed():
     _hb.note_connected()
     _mark_event()
 
+_WATCHDOG_RESTART_ATTEMPTS = 0
+_LAST_WATCHDOG_RESTART_TS = 0.0
+_RESTART_IN_PROGRESS = False
+
 @bot.event
 async def on_ready():
-    global _LAST_READY_TS, _KEEPALIVE_TASK
+    global _LAST_READY_TS, _KEEPALIVE_TASK, _WATCHDOG_RESTART_ATTEMPTS, _LAST_WATCHDOG_RESTART_TS, _RESTART_IN_PROGRESS
     _hb.note_ready()
     _LAST_READY_TS = _now()
+    _WATCHDOG_RESTART_ATTEMPTS = 0
+    _LAST_WATCHDOG_RESTART_TS = time.time()
+    _RESTART_IN_PROGRESS = False
     try:
         if not _watchdog.is_running():
             _watchdog.start()
@@ -1545,8 +1556,36 @@ def _startup_backoff_delay(attempt: int) -> float:
 
 
 async def _maybe_restart(reason: str):
+    global _WATCHDOG_RESTART_ATTEMPTS, _LAST_WATCHDOG_RESTART_TS, _RESTART_IN_PROGRESS
+
+    if _RESTART_IN_PROGRESS:
+        print(f"[WATCHDOG] Restart already in progress; skipping duplicate trigger: {reason}", flush=True)
+        return
+
+    _RESTART_IN_PROGRESS = True
     try:
-        print(f"[WATCHDOG] Restarting: {reason}", flush=True)
+        now = time.time()
+        since_last = now - _LAST_WATCHDOG_RESTART_TS if _LAST_WATCHDOG_RESTART_TS else None
+        if since_last is not None and since_last < max(0.0, WATCHDOG_MIN_RESTART_INTERVAL_SEC):
+            wait = max(0.0, WATCHDOG_MIN_RESTART_INTERVAL_SEC - since_last)
+            print(f"[WATCHDOG] Restart suppressed for {wait:.1f}s (reason: {reason})", flush=True)
+            await asyncio.sleep(wait)
+
+        base = max(1.0, WATCHDOG_RESTART_BACKOFF_BASE_SEC)
+        cap = max(base, WATCHDOG_RESTART_BACKOFF_CAP_SEC)
+        delay = min(cap, base * (2 ** max(0, _WATCHDOG_RESTART_ATTEMPTS)))
+        delay += random.uniform(0.0, max(0.0, WATCHDOG_RESTART_JITTER_SEC))
+
+        print(
+            f"[WATCHDOG] Restart scheduled in {delay:.1f}s "
+            f"(attempt {_WATCHDOG_RESTART_ATTEMPTS + 1}, reason: {reason})",
+            flush=True,
+        )
+        await asyncio.sleep(delay)
+
+        _WATCHDOG_RESTART_ATTEMPTS += 1
+        _LAST_WATCHDOG_RESTART_TS = time.time()
+
         try:
             await _shutdown_background_tasks()
         except Exception:
@@ -1560,6 +1599,7 @@ async def _maybe_restart(reason: str):
             await bot.close()
         finally:
             sys.exit(1)
+
 
 def _get_latency_s() -> float | None:
     try:
@@ -1599,9 +1639,9 @@ async def _watchdog():
             await _maybe_restart(f"zombie: no events for {int(idle_for)}s, latency={latency}")
         return
 
-    # If disconnected, only restart after a long downtime.
+    # If disconnected, only restart after a long downtime and only when the client is not already closed.
     down_for = _hb.disconnected_age_s()
-    if down_for is not None and down_for > WATCHDOG_DISCONNECT_AGE_SEC:
+    if not bot.is_closed() and down_for is not None and down_for > WATCHDOG_DISCONNECT_AGE_SEC:
         await _maybe_restart(f"disconnected too long: {int(down_for)}s")
 
 def _health_payload() -> tuple[dict, int]:
