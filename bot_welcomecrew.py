@@ -61,6 +61,11 @@ ENABLE_CMD_PING            = env_bool("ENABLE_CMD_PING", True)
 ENABLE_CMD_CHECKSHEET      = env_bool("ENABLE_CMD_CHECKSHEET", True)
 ENABLE_CMD_REBOOT          = env_bool("ENABLE_CMD_REBOOT", True)
 ENABLE_WEB_SERVER          = env_bool("ENABLE_WEB_SERVER", True)
+ENABLE_STARTUP_SLASH_SYNC = env_bool("ENABLE_STARTUP_SLASH_SYNC", False)
+STARTUP_MAX_RETRIES       = int(os.getenv("STARTUP_MAX_RETRIES", "8"))
+STARTUP_BACKOFF_BASE_SEC  = float(os.getenv("STARTUP_BACKOFF_BASE_SEC", "30"))
+STARTUP_BACKOFF_CAP_SEC   = float(os.getenv("STARTUP_BACKOFF_CAP_SEC", "900"))
+STARTUP_JITTER_SEC        = float(os.getenv("STARTUP_JITTER_SEC", "5"))
 
 # Live watchers
 ENABLE_LIVE_WATCH          = env_bool("ENABLE_LIVE_WATCH", True)
@@ -274,11 +279,15 @@ async def slash_help(interaction: discord.Interaction):
 # --- Ensure slash commands are visible (once per boot) -----------------------
 @bot.event
 async def setup_hook():
-    try:
-        await bot.tree.sync()
-        print("Slash commands synced.", flush=True)
-    except Exception as e:
-        print(f"Slash sync failed: {e}", flush=True)
+    if ENABLE_STARTUP_SLASH_SYNC:
+        try:
+            await bot.tree.sync()
+            print("Slash commands synced.", flush=True)
+        except Exception as e:
+            print(f"Slash sync failed: {e}", flush=True)
+    else:
+        print("Slash command sync skipped at startup (ENABLE_STARTUP_SLASH_SYNC=OFF).", flush=True)
+
     try:
         await _run_blocking(_load_clan_tags, True)
     except Exception as e:
@@ -1493,9 +1502,55 @@ async def on_ready():
 async def on_disconnect():
     _hb.note_disconnected()
 
+async def _cancel_task(task: Optional[asyncio.Task], name: str) -> None:
+    if task is None:
+        return
+    if task.done():
+        return
+    try:
+        task.cancel()
+        await task
+    except asyncio.CancelledError:
+        pass
+    except Exception as e:
+        print(f"[{name}] cancel failed: {type(e).__name__}: {e}", flush=True)
+
+
+async def _shutdown_background_tasks() -> None:
+    global _KEEPALIVE_TASK, _refresh_task
+    await _cancel_task(_KEEPALIVE_TASK, "keepalive")
+    _KEEPALIVE_TASK = None
+    await _cancel_task(_refresh_task, "refresh")
+    _refresh_task = None
+
+
+def _is_startup_rate_limit(exc: Exception) -> bool:
+    msg = str(exc).lower()
+    return any(tok in msg for tok in (
+        "cloudflare",
+        "error 1015",
+        "you are being rate limited",
+        "access denied",
+        "429 too many requests",
+        "discord.errors.httpexception: 429",
+    ))
+
+
+def _startup_backoff_delay(attempt: int) -> float:
+    base = max(1.0, STARTUP_BACKOFF_BASE_SEC)
+    cap = max(base, STARTUP_BACKOFF_CAP_SEC)
+    delay = min(cap, base * (2 ** max(0, attempt - 1)))
+    jitter = random.uniform(0.0, max(0.0, STARTUP_JITTER_SEC))
+    return delay + jitter
+
+
 async def _maybe_restart(reason: str):
     try:
         print(f"[WATCHDOG] Restarting: {reason}", flush=True)
+        try:
+            await _shutdown_background_tasks()
+        except Exception:
+            pass
         try:
             await stop_webserver()
         except Exception:
@@ -1585,11 +1640,13 @@ _WEB_RUNNER: web.AppRunner | None = None
 
 async def start_webserver():
     global _WEB_RUNNER
+    if not ENABLE_WEB_SERVER:
+        print("[keepalive] HTTP server disabled (ENABLE_WEB_SERVER=OFF)", flush=True)
+        return
+    if _WEB_RUNNER is not None:
+        return
+
     app = web.Application()
-    app["session"] = ClientSession()
-    async def _close_session(app):
-        await app["session"].close()
-    app.on_cleanup.append(_close_session)
 
     if STRICT_PROBE:
         app.router.add_get("/", _health_json)
@@ -1863,11 +1920,52 @@ async def on_thread_update(before: discord.Thread, after: discord.Thread):
         print(f"on_thread_update error: {type(e).__name__}: {e}", flush=True)
 
 # ------------------------ start -----------------------
+async def _run_bot_once():
+    web_started = False
+    try:
+        if ENABLE_WEB_SERVER:
+            await start_webserver()
+            web_started = True
+        await bot.start(TOKEN)
+    finally:
+        try:
+            await _shutdown_background_tasks()
+        except Exception:
+            pass
+        if web_started:
+            try:
+                await stop_webserver()
+            except Exception:
+                pass
+
+
 async def _boot():
     if not TOKEN or len(TOKEN) < 20:
         raise RuntimeError("Missing/short DISCORD_TOKEN.")
-    asyncio.create_task(start_webserver())
-    await bot.start(TOKEN)
+
+    last_exc: Exception | None = None
+    for attempt in range(1, max(1, STARTUP_MAX_RETRIES) + 1):
+        try:
+            _print_boot_info()
+            print(f"[startup] login attempt {attempt}/{max(1, STARTUP_MAX_RETRIES)}", flush=True)
+            await _run_bot_once()
+            return
+        except KeyboardInterrupt:
+            raise
+        except Exception as e:
+            last_exc = e
+            is_rl = _is_startup_rate_limit(e)
+            print(f"[startup] failed: {type(e).__name__}: {e}", flush=True)
+            if attempt >= max(1, STARTUP_MAX_RETRIES) or not is_rl:
+                raise
+
+            delay = _startup_backoff_delay(attempt)
+            print(f"[startup] rate limited by Discord/Cloudflare; sleeping {delay:.1f}s before retry", flush=True)
+            await asyncio.sleep(delay)
+
+    if last_exc is not None:
+        raise last_exc
+
 
 if __name__ == "__main__":
     asyncio.run(_boot())
