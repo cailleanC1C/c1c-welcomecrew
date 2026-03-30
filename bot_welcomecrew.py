@@ -1,4 +1,4 @@
-# C1C – WelcomeCrew - v1.0.2 (patched: preserve manual data, insert-only toggle)
+# C1C – WelcomeCrew - v1.0.2 
 
 import os, json, re, asyncio, time, io, random
 from datetime import datetime, timezone as _tz, timedelta as _td
@@ -61,15 +61,6 @@ ENABLE_CMD_PING            = env_bool("ENABLE_CMD_PING", True)
 ENABLE_CMD_CHECKSHEET      = env_bool("ENABLE_CMD_CHECKSHEET", True)
 ENABLE_CMD_REBOOT          = env_bool("ENABLE_CMD_REBOOT", True)
 ENABLE_WEB_SERVER          = env_bool("ENABLE_WEB_SERVER", True)
-ENABLE_STARTUP_SLASH_SYNC = env_bool("ENABLE_STARTUP_SLASH_SYNC", False)
-STARTUP_MAX_RETRIES       = int(os.getenv("STARTUP_MAX_RETRIES", "8"))
-STARTUP_BACKOFF_BASE_SEC  = float(os.getenv("STARTUP_BACKOFF_BASE_SEC", "30"))
-STARTUP_BACKOFF_CAP_SEC   = float(os.getenv("STARTUP_BACKOFF_CAP_SEC", "900"))
-STARTUP_JITTER_SEC        = float(os.getenv("STARTUP_JITTER_SEC", "5"))
-WATCHDOG_MIN_RESTART_INTERVAL_SEC = float(os.getenv("WATCHDOG_MIN_RESTART_INTERVAL_SEC", "120"))
-WATCHDOG_RESTART_BACKOFF_BASE_SEC = float(os.getenv("WATCHDOG_RESTART_BACKOFF_BASE_SEC", "60"))
-WATCHDOG_RESTART_BACKOFF_CAP_SEC  = float(os.getenv("WATCHDOG_RESTART_BACKOFF_CAP_SEC", "900"))
-WATCHDOG_RESTART_JITTER_SEC       = float(os.getenv("WATCHDOG_RESTART_JITTER_SEC", "10"))
 
 # Live watchers
 ENABLE_LIVE_WATCH          = env_bool("ENABLE_LIVE_WATCH", True)
@@ -291,7 +282,6 @@ async def setup_hook():
             print(f"Slash sync failed: {e}", flush=True)
     else:
         print("Slash command sync skipped at startup (ENABLE_STARTUP_SLASH_SYNC=OFF).", flush=True)
-
     try:
         await _run_blocking(_load_clan_tags, True)
     except Exception as e:
@@ -708,6 +698,7 @@ WATCHDOG_DISCONNECT_AGE_SEC = int(os.getenv(
     os.getenv("WATCHDOG_MAX_DISCONNECT_SEC", "600"),
 ))
 WATCHDOG_LATENCY_SEC = float(os.getenv("WATCHDOG_LATENCY_SEC", "10"))
+WATCHDOG_ENABLE_ZOMBIE_RESTART = env_bool("WATCHDOG_ENABLE_ZOMBIE_RESTART", False)
 
 # Keepalive ping config (matchmaker-style)
 KEEPALIVE_PING_URL = os.getenv("KEEPALIVE_PING_URL", "").strip()
@@ -1483,18 +1474,11 @@ async def on_resumed():
     _hb.note_connected()
     _mark_event()
 
-_WATCHDOG_RESTART_ATTEMPTS = 0
-_LAST_WATCHDOG_RESTART_TS = 0.0
-_RESTART_IN_PROGRESS = False
-
 @bot.event
 async def on_ready():
-    global _LAST_READY_TS, _KEEPALIVE_TASK, _WATCHDOG_RESTART_ATTEMPTS, _LAST_WATCHDOG_RESTART_TS, _RESTART_IN_PROGRESS
+    global _LAST_READY_TS, _KEEPALIVE_TASK
     _hb.note_ready()
     _LAST_READY_TS = _now()
-    _WATCHDOG_RESTART_ATTEMPTS = 0
-    _LAST_WATCHDOG_RESTART_TS = time.time()
-    _RESTART_IN_PROGRESS = False
     try:
         if not _watchdog.is_running():
             _watchdog.start()
@@ -1513,83 +1497,9 @@ async def on_ready():
 async def on_disconnect():
     _hb.note_disconnected()
 
-async def _cancel_task(task: Optional[asyncio.Task], name: str) -> None:
-    if task is None:
-        return
-    if task.done():
-        return
-    try:
-        task.cancel()
-        await task
-    except asyncio.CancelledError:
-        pass
-    except Exception as e:
-        print(f"[{name}] cancel failed: {type(e).__name__}: {e}", flush=True)
-
-
-async def _shutdown_background_tasks() -> None:
-    global _KEEPALIVE_TASK, _refresh_task
-    await _cancel_task(_KEEPALIVE_TASK, "keepalive")
-    _KEEPALIVE_TASK = None
-    await _cancel_task(_refresh_task, "refresh")
-    _refresh_task = None
-
-
-def _is_startup_rate_limit(exc: Exception) -> bool:
-    msg = str(exc).lower()
-    return any(tok in msg for tok in (
-        "cloudflare",
-        "error 1015",
-        "you are being rate limited",
-        "access denied",
-        "429 too many requests",
-        "discord.errors.httpexception: 429",
-    ))
-
-
-def _startup_backoff_delay(attempt: int) -> float:
-    base = max(1.0, STARTUP_BACKOFF_BASE_SEC)
-    cap = max(base, STARTUP_BACKOFF_CAP_SEC)
-    delay = min(cap, base * (2 ** max(0, attempt - 1)))
-    jitter = random.uniform(0.0, max(0.0, STARTUP_JITTER_SEC))
-    return delay + jitter
-
-
 async def _maybe_restart(reason: str):
-    global _WATCHDOG_RESTART_ATTEMPTS, _LAST_WATCHDOG_RESTART_TS, _RESTART_IN_PROGRESS
-
-    if _RESTART_IN_PROGRESS:
-        print(f"[WATCHDOG] Restart already in progress; skipping duplicate trigger: {reason}", flush=True)
-        return
-
-    _RESTART_IN_PROGRESS = True
     try:
-        now = time.time()
-        since_last = now - _LAST_WATCHDOG_RESTART_TS if _LAST_WATCHDOG_RESTART_TS else None
-        if since_last is not None and since_last < max(0.0, WATCHDOG_MIN_RESTART_INTERVAL_SEC):
-            wait = max(0.0, WATCHDOG_MIN_RESTART_INTERVAL_SEC - since_last)
-            print(f"[WATCHDOG] Restart suppressed for {wait:.1f}s (reason: {reason})", flush=True)
-            await asyncio.sleep(wait)
-
-        base = max(1.0, WATCHDOG_RESTART_BACKOFF_BASE_SEC)
-        cap = max(base, WATCHDOG_RESTART_BACKOFF_CAP_SEC)
-        delay = min(cap, base * (2 ** max(0, _WATCHDOG_RESTART_ATTEMPTS)))
-        delay += random.uniform(0.0, max(0.0, WATCHDOG_RESTART_JITTER_SEC))
-
-        print(
-            f"[WATCHDOG] Restart scheduled in {delay:.1f}s "
-            f"(attempt {_WATCHDOG_RESTART_ATTEMPTS + 1}, reason: {reason})",
-            flush=True,
-        )
-        await asyncio.sleep(delay)
-
-        _WATCHDOG_RESTART_ATTEMPTS += 1
-        _LAST_WATCHDOG_RESTART_TS = time.time()
-
-        try:
-            await _shutdown_background_tasks()
-        except Exception:
-            pass
+        print(f"[WATCHDOG] Restarting: {reason}", flush=True)
         try:
             await stop_webserver()
         except Exception:
@@ -1599,7 +1509,6 @@ async def _maybe_restart(reason: str):
             await bot.close()
         finally:
             sys.exit(1)
-
 
 def _get_latency_s() -> float | None:
     try:
@@ -1630,18 +1539,19 @@ async def _keepalive_ping_loop():
 
 @tasks.loop(seconds=WATCHDOG_CHECK_SEC)
 async def _watchdog():
-    # If connected, check for zombie state (no events for a long while + bad latency).
+    # For low-traffic watcher bots, normal quiet periods should NOT trigger restarts.
+    # Only perform zombie restarts when explicitly enabled.
     if _hb.connected:
-        idle_for = _hb.last_event_age_s()
-        latency = _get_latency_s()
-
-        if idle_for is not None and idle_for > WATCHDOG_ZOMBIE_SEC and (latency is None or latency > WATCHDOG_LATENCY_SEC):
-            await _maybe_restart(f"zombie: no events for {int(idle_for)}s, latency={latency}")
+        if WATCHDOG_ENABLE_ZOMBIE_RESTART:
+            idle_for = _hb.last_event_age_s()
+            latency = _get_latency_s()
+            if idle_for is not None and idle_for > WATCHDOG_ZOMBIE_SEC and (latency is None or latency > WATCHDOG_LATENCY_SEC):
+                await _maybe_restart(f"zombie: no events for {int(idle_for)}s, latency={latency}")
         return
 
-    # If disconnected, only restart after a long downtime and only when the client is not already closed.
+    # If disconnected, only restart after a long downtime.
     down_for = _hb.disconnected_age_s()
-    if not bot.is_closed() and down_for is not None and down_for > WATCHDOG_DISCONNECT_AGE_SEC:
+    if down_for is not None and down_for > WATCHDOG_DISCONNECT_AGE_SEC:
         await _maybe_restart(f"disconnected too long: {int(down_for)}s")
 
 def _health_payload() -> tuple[dict, int]:
@@ -1649,20 +1559,23 @@ def _health_payload() -> tuple[dict, int]:
     age = _hb.last_event_age_s()
     latency = _get_latency_s()
 
+    degraded = bool(
+        connected and WATCHDOG_ENABLE_ZOMBIE_RESTART and (
+            (age is not None and age > WATCHDOG_ZOMBIE_SEC)
+            or (latency is not None and latency > WATCHDOG_LATENCY_SEC)
+        )
+    )
     status = 503 if not connected else 200
-    if connected and (
-        (age is not None and age > WATCHDOG_ZOMBIE_SEC)
-        or (latency is not None and latency > WATCHDOG_LATENCY_SEC)
-    ):
-        status = 206
 
     body = {
         "ok": status == 200,
         "connected": connected,
+        "degraded": degraded,
         "uptime": uptime_str(),
         "last_event_age_s": age,
         "latency_s": latency,
         "disconnected_age_s": _hb.disconnected_age_s(),
+        "watchdog_enable_zombie_restart": WATCHDOG_ENABLE_ZOMBIE_RESTART,
     }
     return body, status
 
@@ -1680,12 +1593,6 @@ _WEB_RUNNER: web.AppRunner | None = None
 
 async def start_webserver():
     global _WEB_RUNNER
-    if not ENABLE_WEB_SERVER:
-        print("[keepalive] HTTP server disabled (ENABLE_WEB_SERVER=OFF)", flush=True)
-        return
-    if _WEB_RUNNER is not None:
-        return
-
     app = web.Application()
 
     if STRICT_PROBE:
@@ -1960,52 +1867,11 @@ async def on_thread_update(before: discord.Thread, after: discord.Thread):
         print(f"on_thread_update error: {type(e).__name__}: {e}", flush=True)
 
 # ------------------------ start -----------------------
-async def _run_bot_once():
-    web_started = False
-    try:
-        if ENABLE_WEB_SERVER:
-            await start_webserver()
-            web_started = True
-        await bot.start(TOKEN)
-    finally:
-        try:
-            await _shutdown_background_tasks()
-        except Exception:
-            pass
-        if web_started:
-            try:
-                await stop_webserver()
-            except Exception:
-                pass
-
-
 async def _boot():
     if not TOKEN or len(TOKEN) < 20:
         raise RuntimeError("Missing/short DISCORD_TOKEN.")
-
-    last_exc: Exception | None = None
-    for attempt in range(1, max(1, STARTUP_MAX_RETRIES) + 1):
-        try:
-            _print_boot_info()
-            print(f"[startup] login attempt {attempt}/{max(1, STARTUP_MAX_RETRIES)}", flush=True)
-            await _run_bot_once()
-            return
-        except KeyboardInterrupt:
-            raise
-        except Exception as e:
-            last_exc = e
-            is_rl = _is_startup_rate_limit(e)
-            print(f"[startup] failed: {type(e).__name__}: {e}", flush=True)
-            if attempt >= max(1, STARTUP_MAX_RETRIES) or not is_rl:
-                raise
-
-            delay = _startup_backoff_delay(attempt)
-            print(f"[startup] rate limited by Discord/Cloudflare; sleeping {delay:.1f}s before retry", flush=True)
-            await asyncio.sleep(delay)
-
-    if last_exc is not None:
-        raise last_exc
-
+    asyncio.create_task(start_webserver())
+    await bot.start(TOKEN)
 
 if __name__ == "__main__":
     asyncio.run(_boot())
