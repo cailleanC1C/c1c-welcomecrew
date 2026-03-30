@@ -1928,3 +1928,6 @@ async def _boot():
     print("[boot] connecting to Discord...", flush=True)
 
     await bot.start(TOKEN)
+
+if __name__ == "__main__":
+    asyncio.run(_boot())
