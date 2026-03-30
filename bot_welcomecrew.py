@@ -1890,24 +1890,35 @@ async def on_thread_update(before: discord.Thread, after: discord.Thread):
         print(f"on_thread_update error: {type(e).__name__}: {e}", flush=True)
 
 # ------------------------ start -----------------------
+
+@bot.event
+async def on_ready():
+    print(f"Logged in as {bot.user}", flush=True)
+
+
 async def _boot():
     print("[boot] starting...", flush=True)
 
     if not TOKEN or len(TOKEN) < 20:
         raise RuntimeError("Missing/invalid DISCORD_TOKEN")
 
-    # --- Webserver (Render port binding) ---
+    # --- Start webserver ---
     if ENABLE_WEB_SERVER:
         try:
             await start_webserver()
+            print("[boot] webserver started", flush=True)
         except Exception as e:
             print(f"[boot] webserver failed: {e}", flush=True)
 
-    # --- Background tasks ---
+    # --- Start background tasks SAFELY ---
     try:
-        if not _watchdog.is_running():
-            _watchdog.start()
-            print("[boot] watchdog started", flush=True)
+        if "_watchdog" in globals():
+            try:
+                _watchdog.start()
+                print("[boot] watchdog started", flush=True)
+            except RuntimeError:
+                # already running → ignore
+                pass
     except Exception as e:
         print(f"[boot] watchdog failed: {e}", flush=True)
 
@@ -1924,10 +1935,15 @@ async def _boot():
     except Exception as e:
         print(f"[boot] keepalive loop failed: {e}", flush=True)
 
-    # --- Discord ---
+    # --- Connect to Discord ---
     print("[boot] connecting to Discord...", flush=True)
 
-    await bot.start(TOKEN)
+    try:
+        await bot.start(TOKEN)
+    except Exception as e:
+        print(f"[fatal] bot.start failed: {type(e).__name__}: {e}", flush=True)
+        raise
+
 
 if __name__ == "__main__":
     asyncio.run(_boot())
