@@ -1891,12 +1891,19 @@ async def on_thread_update(before: discord.Thread, after: discord.Thread):
 
 # ------------------------ start -----------------------
 async def _boot():
-    if not TOKEN or len(TOKEN) < 20:
-        raise RuntimeError("Missing/short DISCORD_TOKEN.")
-    if ENABLE_WEB_SERVER:
-        await start_webserver()
-    await bot.start(TOKEN)
+    print("[boot] starting...", flush=True)
 
-if __name__ == "__main__":
-    asyncio.run(_boot())
+    if ENABLE_WEB_SERVER:
+        try:
+            await start_webserver()
+        except Exception as e:
+            print(f"[boot] webserver failed: {e}", flush=True)
+
+    print("[boot] connecting to Discord...", flush=True)
+
+    try:
+        await bot.start(TOKEN)
+    except Exception as e:
+        print(f"[fatal] bot.start failed: {e}", flush=True)
+        raise
 
