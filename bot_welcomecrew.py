@@ -1,4 +1,4 @@
-# C1C – WelcomeCrew - v1.0.2 
+# C1C – WelcomeCrew - v1.0.2 (patched: preserve manual data, insert-only toggle)
 
 import os, json, re, asyncio, time, io, random
 from datetime import datetime, timezone as _tz, timedelta as _td
@@ -61,6 +61,7 @@ ENABLE_CMD_PING            = env_bool("ENABLE_CMD_PING", True)
 ENABLE_CMD_CHECKSHEET      = env_bool("ENABLE_CMD_CHECKSHEET", True)
 ENABLE_CMD_REBOOT          = env_bool("ENABLE_CMD_REBOOT", True)
 ENABLE_WEB_SERVER          = env_bool("ENABLE_WEB_SERVER", True)
+ENABLE_STARTUP_SLASH_SYNC  = env_bool("ENABLE_STARTUP_SLASH_SYNC", False)
 
 # Live watchers
 ENABLE_LIVE_WATCH          = env_bool("ENABLE_LIVE_WATCH", True)
@@ -691,14 +692,15 @@ _LAST_READY_TS: float = 0.0
 
 STRICT_PROBE = os.getenv("STRICT_PROBE", "0") == "1"  # default: off
 
-WATCHDOG_CHECK_SEC = int(os.getenv("WATCHDOG_CHECK_SEC", "60"))
-WATCHDOG_ZOMBIE_SEC = int(os.getenv("WATCHDOG_ZOMBIE_SEC", "600"))
+WATCHDOG_CHECK_SEC = int(os.getenv("WATCHDOG_CHECK_SEC", "120"))
+WATCHDOG_ZOMBIE_SEC = int(os.getenv("WATCHDOG_ZOMBIE_SEC", "10800"))
 WATCHDOG_DISCONNECT_AGE_SEC = int(os.getenv(
     "WATCHDOG_DISCONNECT_AGE_SEC",
-    os.getenv("WATCHDOG_MAX_DISCONNECT_SEC", "600"),
+    os.getenv("WATCHDOG_MAX_DISCONNECT_SEC", "1800"),
 ))
 WATCHDOG_LATENCY_SEC = float(os.getenv("WATCHDOG_LATENCY_SEC", "10"))
 WATCHDOG_ENABLE_ZOMBIE_RESTART = env_bool("WATCHDOG_ENABLE_ZOMBIE_RESTART", False)
+WATCHDOG_MIN_RESTART_INTERVAL_SEC = int(os.getenv("WATCHDOG_MIN_RESTART_INTERVAL_SEC", "300"))
 
 # Keepalive ping config (matchmaker-style)
 KEEPALIVE_PING_URL = os.getenv("KEEPALIVE_PING_URL", "").strip()
@@ -752,6 +754,7 @@ _hb = _Heartbeat()
 
 # Track keepalive task so we don't spawn duplicates on reconnects.
 _KEEPALIVE_TASK: Optional[asyncio.Task] = None
+_LAST_RESTART_TS: float = 0.0
 
 def _mark_event() -> None:
     _hb.note_event()
@@ -1498,8 +1501,29 @@ async def on_disconnect():
     _hb.note_disconnected()
 
 async def _maybe_restart(reason: str):
+    global _LAST_RESTART_TS, _KEEPALIVE_TASK, _refresh_task
+    now = _now()
+    since_last = now - _LAST_RESTART_TS if _LAST_RESTART_TS else None
+    if since_last is not None and since_last < WATCHDOG_MIN_RESTART_INTERVAL_SEC:
+        print(
+            f"[WATCHDOG] Restart suppressed ({reason}); last restart {since_last:.1f}s ago.",
+            flush=True,
+        )
+        return
+
+    _LAST_RESTART_TS = now
     try:
         print(f"[WATCHDOG] Restarting: {reason}", flush=True)
+        try:
+            if _KEEPALIVE_TASK and not _KEEPALIVE_TASK.done():
+                _KEEPALIVE_TASK.cancel()
+        except Exception:
+            pass
+        try:
+            if _refresh_task and not _refresh_task.done():
+                _refresh_task.cancel()
+        except Exception:
+            pass
         try:
             await stop_webserver()
         except Exception:
@@ -1539,14 +1563,13 @@ async def _keepalive_ping_loop():
 
 @tasks.loop(seconds=WATCHDOG_CHECK_SEC)
 async def _watchdog():
-    # For low-traffic watcher bots, normal quiet periods should NOT trigger restarts.
-    # Only perform zombie restarts when explicitly enabled.
+    # If connected, check for zombie state (no events for a long while + bad latency).
     if _hb.connected:
-        if WATCHDOG_ENABLE_ZOMBIE_RESTART:
-            idle_for = _hb.last_event_age_s()
-            latency = _get_latency_s()
-            if idle_for is not None and idle_for > WATCHDOG_ZOMBIE_SEC and (latency is None or latency > WATCHDOG_LATENCY_SEC):
-                await _maybe_restart(f"zombie: no events for {int(idle_for)}s, latency={latency}")
+        idle_for = _hb.last_event_age_s()
+        latency = _get_latency_s()
+
+        if idle_for is not None and idle_for > WATCHDOG_ZOMBIE_SEC and (latency is None or latency > WATCHDOG_LATENCY_SEC):
+            await _maybe_restart(f"zombie: no events for {int(idle_for)}s, latency={latency}")
         return
 
     # If disconnected, only restart after a long downtime.
@@ -1559,23 +1582,20 @@ def _health_payload() -> tuple[dict, int]:
     age = _hb.last_event_age_s()
     latency = _get_latency_s()
 
-    degraded = bool(
-        connected and WATCHDOG_ENABLE_ZOMBIE_RESTART and (
-            (age is not None and age > WATCHDOG_ZOMBIE_SEC)
-            or (latency is not None and latency > WATCHDOG_LATENCY_SEC)
-        )
-    )
     status = 503 if not connected else 200
+    if connected and (
+        (age is not None and age > WATCHDOG_ZOMBIE_SEC)
+        or (latency is not None and latency > WATCHDOG_LATENCY_SEC)
+    ):
+        status = 206
 
     body = {
         "ok": status == 200,
         "connected": connected,
-        "degraded": degraded,
         "uptime": uptime_str(),
         "last_event_age_s": age,
         "latency_s": latency,
         "disconnected_age_s": _hb.disconnected_age_s(),
-        "watchdog_enable_zombie_restart": WATCHDOG_ENABLE_ZOMBIE_RESTART,
     }
     return body, status
 
@@ -1593,6 +1613,9 @@ _WEB_RUNNER: web.AppRunner | None = None
 
 async def start_webserver():
     global _WEB_RUNNER
+    if _WEB_RUNNER is not None:
+        return
+
     app = web.Application()
 
     if STRICT_PROBE:
@@ -1870,7 +1893,8 @@ async def on_thread_update(before: discord.Thread, after: discord.Thread):
 async def _boot():
     if not TOKEN or len(TOKEN) < 20:
         raise RuntimeError("Missing/short DISCORD_TOKEN.")
-    asyncio.create_task(start_webserver())
+    if ENABLE_WEB_SERVER:
+        await start_webserver()
     await bot.start(TOKEN)
 
 if __name__ == "__main__":
