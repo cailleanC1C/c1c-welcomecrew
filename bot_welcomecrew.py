@@ -1477,24 +1477,46 @@ async def on_resumed():
     _hb.note_connected()
     _mark_event()
 
-@bot.event
-async def on_ready():
-    global _LAST_READY_TS, _KEEPALIVE_TASK
-    _hb.note_ready()
-    _LAST_READY_TS = _now()
+def _task_alive(task: Optional[asyncio.Task]) -> bool:
+    return task is not None and not task.done()
+
+
+def _start_watchdog_once() -> None:
     try:
         if not _watchdog.is_running():
             _watchdog.start()
-    except NameError:
-        pass
+            print("[lifecycle] watchdog started", flush=True)
+    except Exception as e:
+        print(f"[lifecycle] watchdog start failed: {type(e).__name__}: {e}", flush=True)
 
-    # Start keepalive ping loop once per process (mirrors Matchmaker behaviour).
-    if KEEPALIVE_PING_URL and (_KEEPALIVE_TASK is None or _KEEPALIVE_TASK.done()):
-        _KEEPALIVE_TASK = bot.loop.create_task(_keepalive_ping_loop())
 
+def _ensure_keepalive_task() -> None:
+    global _KEEPALIVE_TASK
+    if not KEEPALIVE_PING_URL:
+        return
+    if _task_alive(_KEEPALIVE_TASK):
+        return
+    _KEEPALIVE_TASK = asyncio.create_task(_keepalive_ping_loop(), name="welcomecrew.keepalive")
+    print("[lifecycle] keepalive loop started", flush=True)
+
+
+def _ensure_refresh_task() -> None:
     global _refresh_task
-    if _refresh_task is None or _refresh_task.done():
-        _refresh_task = bot.loop.create_task(scheduled_refresh_loop())
+    if _task_alive(_refresh_task):
+        return
+    _refresh_task = asyncio.create_task(scheduled_refresh_loop(), name="welcomecrew.refresh")
+    print("[lifecycle] refresh loop started", flush=True)
+
+
+@bot.event
+async def on_ready():
+    global _LAST_READY_TS
+    _hb.note_ready()
+    _LAST_READY_TS = _now()
+    print(f"Logged in as {bot.user}", flush=True)
+    _start_watchdog_once()
+    _ensure_keepalive_task()
+    _ensure_refresh_task()
 
 @bot.event
 async def on_disconnect():
@@ -1551,14 +1573,20 @@ async def _keepalive_ping_loop():
         return
 
     timeout = ClientTimeout(total=KEEPALIVE_TIMEOUT_SEC)
-    async with ClientSession(timeout=timeout) as session:
-        while True:
-            try:
-                async with session.get(KEEPALIVE_PING_URL) as resp:
-                    print(f"[keepalive] ping {KEEPALIVE_PING_URL} -> {resp.status}", flush=True)
-            except Exception as e:
-                print(f"[keepalive] ping failed: {type(e).__name__}: {e}", flush=True)
-            await asyncio.sleep(max(1, KEEPALIVE_INTERVAL_SEC))
+    try:
+        async with ClientSession(timeout=timeout) as session:
+            while True:
+                try:
+                    async with session.get(KEEPALIVE_PING_URL) as resp:
+                        print(f"[keepalive] ping {KEEPALIVE_PING_URL} -> {resp.status}", flush=True)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    print(f"[keepalive] ping failed: {type(e).__name__}: {e}", flush=True)
+                await asyncio.sleep(max(1, KEEPALIVE_INTERVAL_SEC))
+    except asyncio.CancelledError:
+        print("[keepalive] loop cancelled", flush=True)
+        raise
 
 
 @tasks.loop(seconds=WATCHDOG_CHECK_SEC)
@@ -1678,43 +1706,49 @@ async def scheduled_refresh_loop():
     times = _parse_times_csv(REFRESH_TIMES)
     print(f"[refresh] TZ={TIMEZONE} times={times}", flush=True)
 
-    while True:
-        now = datetime.now(tz)
-        today_candidates = [
-            now.replace(hour=h, minute=m, second=0, microsecond=0)
-            for (h, m) in times
-            if now.replace(hour=h, minute=m, second=0, microsecond=0) > now
-        ]
-        if today_candidates:
-            next_dt = min(today_candidates)
-        else:
-            h, m = times[0]
-            next_dt = (now + _td(days=1)).replace(hour=h, minute=m, second=0, microsecond=0)
+    try:
+        while True:
+            now = datetime.now(tz)
+            today_candidates = [
+                now.replace(hour=h, minute=m, second=0, microsecond=0)
+                for (h, m) in times
+                if now.replace(hour=h, minute=m, second=0, microsecond=0) > now
+            ]
+            if today_candidates:
+                next_dt = min(today_candidates)
+            else:
+                h, m = times[0]
+                next_dt = (now + _td(days=1)).replace(hour=h, minute=m, second=0, microsecond=0)
 
-        await _sleep_until(next_dt)
+            await _sleep_until(next_dt)
 
-        try:
-            await _run_blocking(_load_clan_tags, True)
             try:
-                await asyncio.gather(
-                    _run_blocking(get_ws, SHEET1_NAME, HEADERS_SHEET1),
-                    _run_blocking(get_ws, SHEET4_NAME, HEADERS_SHEET4),
-                )
-            except Exception:
-                pass
+                await _run_blocking(_load_clan_tags, True)
+                try:
+                    await asyncio.gather(
+                        _run_blocking(get_ws, SHEET1_NAME, HEADERS_SHEET1),
+                        _run_blocking(get_ws, SHEET4_NAME, HEADERS_SHEET4),
+                    )
+                except Exception:
+                    pass
 
-            if LOG_CHANNEL_ID:
-                ch = bot.get_channel(LOG_CHANNEL_ID)
-                if isinstance(ch, (discord.TextChannel, discord.Thread)):
-                    when_local = next_dt.astimezone(tz).strftime("%Y-%m-%d %H:%M")
-                    try:
-                        await ch.send(f"🔄 WelcomeCrew: refreshed caches at {when_local} ({TIMEZONE})")
-                    except Exception:
-                        pass
+                if LOG_CHANNEL_ID:
+                    ch = bot.get_channel(LOG_CHANNEL_ID)
+                    if isinstance(ch, (discord.TextChannel, discord.Thread)):
+                        when_local = next_dt.astimezone(tz).strftime("%Y-%m-%d %H:%M")
+                        try:
+                            await ch.send(f"🔄 WelcomeCrew: refreshed caches at {when_local} ({TIMEZONE})")
+                        except Exception:
+                            pass
 
-            print("[refresh] clan tags + sheet handles refreshed", flush=True)
-        except Exception as e:
-            print(f"[refresh] failed: {type(e).__name__}: {e}", flush=True)
+                print("[refresh] clan tags + sheet handles refreshed", flush=True)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                print(f"[refresh] failed: {type(e).__name__}: {e}", flush=True)
+    except asyncio.CancelledError:
+        print("[refresh] loop cancelled", flush=True)
+        raise
 
 _pending_welcome: Dict[int, Dict[str, Any]] = {}
 _pending_promo:   Dict[int, Dict[str, Any]] = {}
@@ -1891,58 +1925,41 @@ async def on_thread_update(before: discord.Thread, after: discord.Thread):
 
 # ------------------------ start -----------------------
 
-@bot.event
-async def on_ready():
-    print(f"Logged in as {bot.user}", flush=True)
-
-
 async def _boot():
     print("[boot] starting...", flush=True)
 
     if not TOKEN or len(TOKEN) < 20:
         raise RuntimeError("Missing/invalid DISCORD_TOKEN")
 
-    # --- Start webserver ---
     if ENABLE_WEB_SERVER:
         try:
             await start_webserver()
             print("[boot] webserver started", flush=True)
         except Exception as e:
-            print(f"[boot] webserver failed: {e}", flush=True)
+            print(f"[boot] webserver failed: {type(e).__name__}: {e}", flush=True)
+            raise
 
-    # --- Start background tasks SAFELY ---
-    try:
-        if "_watchdog" in globals():
-            try:
-                _watchdog.start()
-                print("[boot] watchdog started", flush=True)
-            except RuntimeError:
-                # already running → ignore
-                pass
-    except Exception as e:
-        print(f"[boot] watchdog failed: {e}", flush=True)
-
-    try:
-        asyncio.create_task(scheduled_refresh_loop())
-        print("[boot] refresh loop started", flush=True)
-    except Exception as e:
-        print(f"[boot] refresh loop failed: {e}", flush=True)
-
-    try:
-        if KEEPALIVE_PING_URL:
-            asyncio.create_task(_keepalive_ping_loop())
-            print("[boot] keepalive loop started", flush=True)
-    except Exception as e:
-        print(f"[boot] keepalive loop failed: {e}", flush=True)
-
-    # --- Connect to Discord ---
     print("[boot] connecting to Discord...", flush=True)
 
     try:
         await bot.start(TOKEN)
-    except Exception as e:
-        print(f"[fatal] bot.start failed: {type(e).__name__}: {e}", flush=True)
-        raise
+    finally:
+        global _KEEPALIVE_TASK, _refresh_task
+        for label, task in (("keepalive", _KEEPALIVE_TASK), ("refresh", _refresh_task)):
+            if task is not None and not task.done():
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+                except Exception as e:
+                    print(f"[boot] {label} task shutdown failed: {type(e).__name__}: {e}", flush=True)
+        _KEEPALIVE_TASK = None
+        _refresh_task = None
+        try:
+            await stop_webserver()
+        except Exception as e:
+            print(f"[boot] webserver shutdown failed: {type(e).__name__}: {e}", flush=True)
 
 
 if __name__ == "__main__":
